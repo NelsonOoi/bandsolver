@@ -96,20 +96,43 @@ def solve_te(k, g_vectors, eps_mat_inv, n_bands):
 # ---------------------------------------------------------------------------
 
 def solve_bands(k_points, g_vectors, eps_grid, m_indices, n_bands, polarization="tm"):
-    """Compute band structure along a k-path.
+    """Compute band structure along a k-path (vectorized over k-points).
 
     Returns:
         bands: (n_k, n_bands) normalized frequencies.
     """
     eps_mat = build_epsilon_matrix(eps_grid, m_indices)
     eps_mat_inv = np.linalg.inv(eps_mat)
+    return _solve_bands_from_inv(k_points, g_vectors, eps_mat_inv, n_bands, polarization)
 
-    solver = solve_tm if polarization == "tm" else solve_te
 
-    bands = np.zeros((k_points.shape[0], n_bands))
-    for i in range(k_points.shape[0]):
-        bands[i] = solver(k_points[i], g_vectors, eps_mat_inv, n_bands)
-    return bands
+def _solve_bands_from_inv(k_points, g_vectors, eps_mat_inv, n_bands,
+                          polarization="tm", return_vecs=False):
+    """Vectorized band solve given a precomputed eps_mat_inv.
+
+    If return_vecs=True, also returns eigenvectors and the diagonal D used
+    in the Hamiltonian construction (needed for adjoint gradients).
+    """
+    kpg = k_points[:, None, :] + g_vectors[None, :, :]  # (n_k, n_pw, 2)
+
+    if polarization == "tm":
+        kpg_norm = np.sqrt(np.sum(kpg ** 2, axis=-1))  # (n_k, n_pw)
+        H = kpg_norm[:, :, None] * eps_mat_inv[None, :, :] * kpg_norm[:, None, :]
+    else:
+        dot = np.sum(kpg[:, :, None, :] * kpg[:, None, :, :], axis=-1)
+        H = dot * eps_mat_inv[None, :, :]
+
+    H = 0.5 * (H + np.conj(np.swapaxes(H, -2, -1)))
+    eigvals, eigvecs = np.linalg.eigh(H)  # (n_k, n_pw), (n_k, n_pw, n_pw)
+    eigvals = np.clip(eigvals, 0.0, None)
+    freqs = np.sqrt(eigvals[:, :n_bands]) / (2.0 * np.pi)
+
+    if return_vecs:
+        if polarization == "tm":
+            return freqs, eigvecs[:, :, :n_bands], kpg_norm
+        else:
+            return freqs, eigvecs[:, :, :n_bands], kpg
+    return freqs
 
 
 # ---------------------------------------------------------------------------

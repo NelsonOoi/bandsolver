@@ -2,7 +2,7 @@
 PWE Band Structure Solver GUI.
 
 Tkinter GUI with parameter controls, shape presets, drawable dielectric canvas,
-and TM/TE band structure plots.
+TM/TE band structure plots, and PINN inverse design.
 """
 
 import tkinter as tk
@@ -15,6 +15,18 @@ from matplotlib.figure import Figure
 import threading
 
 from pwe import reciprocal_lattice, solve_bands, make_k_path
+
+# Try importing PINN components (torch may not be installed)
+try:
+    import torch
+    from pwe_torch import (reciprocal_lattice as reciprocal_lattice_t,
+                           make_k_path as make_k_path_t,
+                           solve_bands as solve_bands_t,
+                           extract_gap)
+    from pinn import InverseDesignNet, PhysicsLoss
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 
 
 # ---------------------------------------------------------------------------
@@ -93,14 +105,33 @@ class PWEApp:
         self.root.minsize(1200, 700)
 
         self._solving = False
+        self._pinn_training = False
+        self._pinn_cancel = False
         self._draw_mode = False
         self._custom_eps = None  # user-drawn grid
         self._drawing = False    # mouse currently held
         self._preview_job = None # debounce timer id
 
-        # --- Left panel: controls ---
-        ctrl = ttk.Frame(root, padding=10)
-        ctrl.pack(side=tk.LEFT, fill=tk.Y)
+        # --- Left panel: controls (scrollable) ---
+        outer = ttk.Frame(root)
+        outer.pack(side=tk.LEFT, fill=tk.Y)
+
+        canvas_ctrl = tk.Canvas(outer, width=210, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas_ctrl.yview)
+        ctrl = ttk.Frame(canvas_ctrl, padding=10)
+
+        ctrl.bind("<Configure>",
+                  lambda e: canvas_ctrl.configure(scrollregion=canvas_ctrl.bbox("all")))
+        canvas_ctrl.create_window((0, 0), window=ctrl, anchor="nw")
+        canvas_ctrl.configure(yscrollcommand=scrollbar.set)
+
+        canvas_ctrl.pack(side=tk.LEFT, fill=tk.Y, expand=True)
+        scrollbar.pack(side=tk.LEFT, fill=tk.Y)
+
+        # Mouse wheel scrolling
+        def _on_mousewheel(event):
+            canvas_ctrl.yview_scroll(-1 * (event.delta // 120 or (1 if event.delta > 0 else -1)), "units")
+        canvas_ctrl.bind_all("<MouseWheel>", _on_mousewheel)
 
         ttk.Label(ctrl, text="PWE Solver", font=("Helvetica", 14, "bold")).pack(anchor="w")
         ttk.Separator(ctrl, orient="horizontal").pack(fill="x", pady=(5, 10))
@@ -178,8 +209,100 @@ class PWEApp:
         # -- Bandgap info --
         ttk.Separator(ctrl, orient="horizontal").pack(fill="x", pady=10)
         ttk.Label(ctrl, text="Bandgaps", font=("Helvetica", 11, "bold")).pack(anchor="w")
-        self.gap_text = tk.Text(ctrl, height=10, width=26, font=("Courier", 10), state="disabled")
+        self.gap_text = tk.Text(ctrl, height=8, width=26, font=("Courier", 10), state="disabled")
         self.gap_text.pack(fill="x", pady=(5, 0))
+
+        # ==============================================================
+        # PINN Inverse Design section
+        # ==============================================================
+        ttk.Separator(ctrl, orient="horizontal").pack(fill="x", pady=10)
+        ttk.Label(ctrl, text="PINN Inverse Design",
+                  font=("Helvetica", 11, "bold")).pack(anchor="w")
+
+        if not HAS_TORCH:
+            ttk.Label(ctrl, text="(torch not installed)",
+                      foreground="grey").pack(anchor="w")
+        else:
+            self.pinn_params = {}
+
+            # Objective selector: maximize gap or target specific values
+            obj_row = ttk.Frame(ctrl)
+            obj_row.pack(fill="x", pady=(2, 4))
+            self.pinn_maximize_var = tk.BooleanVar(value=False)
+            ttk.Radiobutton(obj_row, text="Target", value=False,
+                            variable=self.pinn_maximize_var,
+                            command=self._on_pinn_obj_change).pack(side=tk.LEFT)
+            ttk.Radiobutton(obj_row, text="Maximize gap", value=True,
+                            variable=self.pinn_maximize_var,
+                            command=self._on_pinn_obj_change).pack(side=tk.LEFT, padx=(6, 0))
+
+            # Target-specific params (disabled when maximize is checked)
+            self._pinn_target_frame = ttk.Frame(ctrl)
+            self._pinn_target_frame.pack(fill="x")
+            pinn_target_defs = [
+                ("target freq", "pinn_target_freq", "0.35"),
+                ("target width","pinn_target_width","0.05"),
+            ]
+            self._pinn_target_entries = []
+            for label_text, key, default in pinn_target_defs:
+                row = ttk.Frame(self._pinn_target_frame)
+                row.pack(fill="x", pady=1)
+                ttk.Label(row, text=label_text, width=12).pack(side=tk.LEFT)
+                var = tk.StringVar(value=default)
+                entry = ttk.Entry(row, textvariable=var, width=8)
+                entry.pack(side=tk.LEFT, padx=(5, 0))
+                self.pinn_params[key] = var
+                self._pinn_target_entries.append(entry)
+
+            pinn_defs = [
+                ("band lo",     "pinn_band_lo",     "0"),
+                ("band hi",     "pinn_band_hi",     "1"),
+                ("steps",       "pinn_steps",       "200"),
+                ("lr",          "pinn_lr",          "0.001"),
+                ("latent dim",  "pinn_latent_dim",  "32"),
+            ]
+            for label_text, key, default in pinn_defs:
+                row = ttk.Frame(ctrl)
+                row.pack(fill="x", pady=1)
+                ttk.Label(row, text=label_text, width=12).pack(side=tk.LEFT)
+                var = tk.StringVar(value=default)
+                ttk.Entry(row, textvariable=var, width=8).pack(side=tk.LEFT, padx=(5, 0))
+                self.pinn_params[key] = var
+
+            # Loss weights in a compact sub-section
+            ttk.Label(ctrl, text="Loss weights", foreground="grey",
+                      font=("Helvetica", 9)).pack(anchor="w", pady=(4, 0))
+            weight_defs = [
+                ("w gap",    "pinn_w_gap",    "1.0"),
+                ("w freq",   "pinn_w_freq",   "1.0"),
+                ("w binary", "pinn_w_binary", "0.1"),
+                ("w bloch",  "pinn_w_bloch",  "0.01"),
+            ]
+            for label_text, key, default in weight_defs:
+                row = ttk.Frame(ctrl)
+                row.pack(fill="x", pady=1)
+                ttk.Label(row, text=label_text, width=12).pack(side=tk.LEFT)
+                var = tk.StringVar(value=default)
+                ttk.Entry(row, textvariable=var, width=8).pack(side=tk.LEFT, padx=(5, 0))
+                self.pinn_params[key] = var
+
+            pinn_btn_row = ttk.Frame(ctrl)
+            pinn_btn_row.pack(fill="x", pady=(6, 2))
+            self.pinn_train_btn = ttk.Button(pinn_btn_row, text="Train PINN",
+                                              command=self._on_pinn_train)
+            self.pinn_train_btn.pack(side=tk.LEFT, expand=True, fill="x", padx=(0, 2))
+            self.pinn_cancel_btn = ttk.Button(pinn_btn_row, text="Stop",
+                                               command=self._on_pinn_cancel,
+                                               state="disabled")
+            self.pinn_cancel_btn.pack(side=tk.LEFT, padx=(2, 0))
+
+            self.pinn_status_var = tk.StringVar(value="")
+            ttk.Label(ctrl, textvariable=self.pinn_status_var,
+                      wraplength=180, foreground="grey").pack(anchor="w", pady=(2, 0))
+
+            # Progress bar
+            self.pinn_progress = ttk.Progressbar(ctrl, mode="determinate", length=180)
+            self.pinn_progress.pack(fill="x", pady=(2, 0))
 
         # --- Right panel: plots ---
         plot_frame = ttk.Frame(root)
@@ -344,7 +467,7 @@ class PWEApp:
         self.canvas.draw_idle()
 
     # -----------------------------------------------------------------------
-    # Solver
+    # PWE Solver
     # -----------------------------------------------------------------------
 
     def _update_pw_count(self, *_):
@@ -425,7 +548,7 @@ class PWEApp:
         self.solve_btn.config(state="normal")
 
     # -----------------------------------------------------------------------
-    # Plotting
+    # Plotting (standard PWE)
     # -----------------------------------------------------------------------
 
     def _update_plots(self, r):
@@ -507,6 +630,286 @@ class PWEApp:
 
         n_pw = (2 * p["n_max"] + 1) ** 2
         self.status_var.set(f"Done. {n_pw} PWs, {len(k_dist)} k-pts")
+
+    # -----------------------------------------------------------------------
+    # PINN Inverse Design
+    # -----------------------------------------------------------------------
+
+    def _on_pinn_obj_change(self):
+        """Enable/disable target freq/width entries based on objective mode."""
+        maximize = self.pinn_maximize_var.get()
+        state = "disabled" if maximize else "normal"
+        for entry in self._pinn_target_entries:
+            entry.config(state=state)
+
+    def _read_pinn_params(self):
+        return {
+            "target_freq":  float(self.pinn_params["pinn_target_freq"].get()),
+            "target_width": float(self.pinn_params["pinn_target_width"].get()),
+            "maximize":     self.pinn_maximize_var.get(),
+            "band_lo":      int(self.pinn_params["pinn_band_lo"].get()),
+            "band_hi":      int(self.pinn_params["pinn_band_hi"].get()),
+            "steps":        int(self.pinn_params["pinn_steps"].get()),
+            "lr":           float(self.pinn_params["pinn_lr"].get()),
+            "latent_dim":   int(self.pinn_params["pinn_latent_dim"].get()),
+            "w_gap":        float(self.pinn_params["pinn_w_gap"].get()),
+            "w_freq":       float(self.pinn_params["pinn_w_freq"].get()),
+            "w_binary":     float(self.pinn_params["pinn_w_binary"].get()),
+            "w_bloch":      float(self.pinn_params["pinn_w_bloch"].get()),
+        }
+
+    def _on_pinn_train(self):
+        if self._pinn_training:
+            return
+        try:
+            pp = self._read_pinn_params()
+            sp = self._read_params()
+        except ValueError:
+            self.pinn_status_var.set("Invalid parameter")
+            return
+
+        self._pinn_training = True
+        self._pinn_cancel = False
+        self.pinn_train_btn.config(state="disabled")
+        self.pinn_cancel_btn.config(state="normal")
+        self.pinn_progress["value"] = 0
+        self.pinn_progress["maximum"] = pp["steps"]
+        self.pinn_status_var.set("Training...")
+
+        thread = threading.Thread(target=self._pinn_worker,
+                                  args=(pp, sp), daemon=True)
+        thread.start()
+
+    def _on_pinn_cancel(self):
+        self._pinn_cancel = True
+        self.pinn_status_var.set("Stopping...")
+
+    def _pinn_worker(self, pp, sp):
+        """Run PINN inverse design training in background thread."""
+        try:
+            torch.manual_seed(42)
+            n_grid = sp["n_grid"]
+            # Force even grid for C4v tiling
+            if n_grid % 2 != 0:
+                n_grid += 1
+
+            g_vectors, m_indices = reciprocal_lattice_t(sp["n_max"])
+            k_points, k_dist, tick_pos, tick_labels = make_k_path_t(sp["n_k_seg"])
+
+            model = InverseDesignNet(
+                N=n_grid, latent_dim=pp["latent_dim"],
+                eps_bg=sp["eps_bg"], eps_rod=sp["eps_rod"],
+            ).double()
+
+            physics_loss = PhysicsLoss(
+                w_gap=pp["w_gap"], w_freq=pp["w_freq"],
+                w_binary=pp["w_binary"], w_bloch=pp["w_bloch"],
+                maximize=pp["maximize"],
+            )
+
+            optimizer = torch.optim.Adam(model.parameters(), lr=pp["lr"])
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, pp["steps"]
+            )
+
+            binary_schedule = np.linspace(
+                pp["w_binary"] * 0.1, pp["w_binary"], pp["steps"]
+            )
+
+            history = []
+            n_bands = sp["n_bands"]
+
+            for step in range(pp["steps"]):
+                if self._pinn_cancel:
+                    break
+
+                optimizer.zero_grad()
+                physics_loss.w_binary = float(binary_schedule[step])
+
+                eps_grid, eps_norm = model(
+                    pp["target_freq"], pp["target_width"],
+                    pp["band_lo"], pp["band_hi"],
+                )
+                bands = solve_bands_t(
+                    k_points, g_vectors, eps_grid, m_indices, n_bands, "tm"
+                )
+                loss, info = physics_loss(
+                    bands, eps_grid, eps_norm,
+                    pp["target_freq"], pp["target_width"],
+                    pp["band_lo"], pp["band_hi"],
+                )
+
+                loss.backward()
+
+                # Skip step if gradients are NaN (degenerate eigenvalues)
+                has_nan = False
+                for p in model.parameters():
+                    if p.grad is not None and torch.isnan(p.grad).any():
+                        has_nan = True
+                        break
+                if has_nan or torch.isnan(loss):
+                    optimizer.zero_grad()
+                    info["step"] = step
+                    info["total"] = float("nan")
+                    history.append(info)
+                    scheduler.step()
+                    continue
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+
+                info["step"] = step
+                history.append(info)
+
+                # Update GUI periodically
+                if (step + 1) % max(1, pp["steps"] // 40) == 0 or step == 0:
+                    _info = dict(info)
+                    _step = step + 1
+                    _total = pp["steps"]
+                    self.root.after(0, lambda s=_step, t=_total, i=_info:
+                        self._pinn_progress_update(s, t, i))
+
+            # Final result
+            with torch.no_grad():
+                eps_grid, eps_norm = model(
+                    pp["target_freq"], pp["target_width"],
+                    pp["band_lo"], pp["band_hi"],
+                )
+                bands = solve_bands_t(
+                    k_points, g_vectors, eps_grid, m_indices, n_bands, "tm"
+                )
+
+            result = {
+                "eps_grid": eps_grid.detach().cpu().numpy(),
+                "bands": bands.detach().cpu().numpy(),
+                "k_dist": k_dist,
+                "tick_pos": tick_pos,
+                "tick_labels": tick_labels,
+                "history": history,
+                "pp": pp,
+                "n_bands": n_bands,
+            }
+            self.root.after(0, lambda: self._pinn_done(result))
+
+        except Exception as e:
+            self.root.after(0, lambda: self._pinn_error(str(e)))
+
+    def _pinn_progress_update(self, step, total, info):
+        """Update progress bar and status from main thread."""
+        self.pinn_progress["value"] = step
+        extra = f" ratio={info['gap_ratio']:.4f}" if "gap_ratio" in info else ""
+        self.pinn_status_var.set(
+            f"[{step}/{total}] loss={info['total']:.5f} "
+            f"gap={info['gap_width']:.4f} mid={info['midgap']:.4f}{extra}"
+        )
+
+    def _pinn_done(self, result):
+        """Display PINN results in the plot area."""
+        self._pinn_training = False
+        self.pinn_train_btn.config(state="normal")
+        self.pinn_cancel_btn.config(state="disabled")
+        self.pinn_progress["value"] = self.pinn_progress["maximum"]
+
+        eps_grid = result["eps_grid"]
+        bands = result["bands"]
+        k_dist = result["k_dist"]
+        tick_pos = result["tick_pos"]
+        tick_labels = result["tick_labels"]
+        history = result["history"]
+        pp = result["pp"]
+        n_bands = result["n_bands"]
+
+        # Compute actual gap from band data (not from smooth approximation)
+        band_lo = pp["band_lo"]
+        band_hi = pp["band_hi"]
+        floor_val = float(np.max(bands[:, band_lo]))   # top of lower band
+        ceil_val = float(np.min(bands[:, band_hi]))     # bottom of upper band
+        gap_width = max(0.0, ceil_val - floor_val)
+        midgap = 0.5 * (ceil_val + floor_val)
+
+        # -- Dielectric (PINN result) --
+        ax = self.ax_eps
+        ax.clear()
+        ax.imshow(eps_grid.T, origin="lower", extent=[0, 1, 0, 1], cmap="RdYlBu_r")
+        ax.set_title("PINN unit cell")
+        ax.set_xlabel("x/a")
+        ax.set_ylabel("y/a")
+        ax.set_aspect("equal")
+
+        # -- TM bands (PINN) --
+        ax = self.ax_tm
+        ax.clear()
+        for i in range(n_bands):
+            ax.plot(k_dist, bands[:, i], color="#2563eb", linewidth=0.9)
+        for tp in tick_pos:
+            ax.axvline(tp, color="grey", linewidth=0.4, linestyle="--")
+        ax.set_xticks(tick_pos)
+        ax.set_xticklabels(tick_labels)
+        ax.set_xlim(k_dist[0], k_dist[-1])
+        ax.set_ylim(0, max(0.8, midgap + gap_width + 0.1))
+        ax.set_ylabel("$\\omega a / 2\\pi c$")
+        ax.set_title("TM (PINN)")
+        # Shade between actual band edges (floor_val to ceil_val)
+        if gap_width > 0:
+            ax.axhspan(floor_val, ceil_val, alpha=0.15, color="#2563eb")
+        ax.axhline(pp["target_freq"], color="red", linewidth=0.7, linestyle=":")
+        ax.axhline(pp["target_freq"] - pp["target_width"] / 2,
+                    color="red", linewidth=0.5, linestyle="--", alpha=0.5)
+        ax.axhline(pp["target_freq"] + pp["target_width"] / 2,
+                    color="red", linewidth=0.5, linestyle="--", alpha=0.5)
+
+        # -- Convergence plot (replaces TE during PINN) --
+        ax = self.ax_te
+        ax.clear()
+        if history:
+            steps = [h["step"] for h in history]
+            ax.plot(steps, [h["total"] for h in history], label="total",
+                    color="#1e293b", linewidth=1.0)
+            ax.plot(steps, [h["loss_gap"] for h in history], label="gap",
+                    color="#2563eb", linewidth=0.8, alpha=0.7)
+            ax.plot(steps, [h["loss_freq"] for h in history], label="freq",
+                    color="#dc2626", linewidth=0.8, alpha=0.7)
+            ax.plot(steps, [h["loss_binary"] for h in history], label="binary",
+                    color="#16a34a", linewidth=0.8, alpha=0.7)
+            ax.set_xlabel("step")
+            ax.set_ylabel("loss")
+            ax.set_title("PINN convergence")
+            ax.legend(fontsize=7, loc="upper right")
+            # Use log scale, but handle zeros gracefully
+            all_vals = [h["total"] for h in history]
+            if min(all_vals) > 0:
+                ax.set_yscale("log")
+
+        self.canvas.draw()
+
+        # Update bandgap text
+        tm_gaps = find_bandgaps(bands, n_bands)
+        lines = ["-- PINN TM --"]
+        if tm_gaps:
+            for b1, b2, gap, mid, ratio in tm_gaps:
+                lines.append(f" {b1}-{b2}: gap={gap:.4f} ratio={ratio:.4f}")
+        else:
+            lines.append(" (none)")
+        lines.append("")
+        lines.append(f"target: f={pp['target_freq']:.3f} w={pp['target_width']:.3f}")
+        lines.append(f"result: f={midgap:.4f} w={gap_width:.4f}")
+
+        self.gap_text.config(state="normal")
+        self.gap_text.delete("1.0", tk.END)
+        self.gap_text.insert("1.0", "\n".join(lines))
+        self.gap_text.config(state="disabled")
+
+        self.pinn_status_var.set(
+            f"Done. gap={gap_width:.4f} midgap={midgap:.4f}"
+        )
+        self.status_var.set("PINN training complete. Press Solve for PWE.")
+
+    def _pinn_error(self, msg):
+        self._pinn_training = False
+        self.pinn_train_btn.config(state="normal")
+        self.pinn_cancel_btn.config(state="disabled")
+        self.pinn_status_var.set(f"Error: {msg}")
 
 
 # ---------------------------------------------------------------------------

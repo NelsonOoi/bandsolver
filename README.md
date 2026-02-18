@@ -127,6 +127,118 @@ Default parameters (r/a=0.2, eps=8.9 rods in air) reproduce the classic square-l
 - `PWEApp` -- Tkinter GUI class. Left panel has parameter entries with a live PW count label that updates as you type `n_max`. Clicking Solve spawns a background thread that runs `solve_bands` for both TM and TE, then posts results back to the main thread to update three matplotlib subplots (dielectric map, TM bands, TE bands) and a text box listing detected bandgaps.
 
 
+## Physics-Informed Neural Network (PINN)
+
+### Overview
+
+`pinn.py` and `pwe_torch.py` add a physics-informed neural network for inverse design of photonic band gaps. Rather than a black-box surrogate, the NN is constrained so its outputs obey the underlying Maxwell equations by construction. The PINN is also accessible from the GUI via the "Train PINN" button.
+
+There are two operating modes:
+
+- **Mode A (inverse design):** The network generates an epsilon grid from a target gap specification, trained end-to-end through a differentiable PWE eigensolve. No pre-computed training data is needed -- gradients flow directly from the physics loss through the solver into the network weights.
+- **Mode B (fast surrogate):** The network predicts band frequencies from an epsilon grid, trained against PWE ground truth with additional physics-based loss terms.
+
+### Hard constraints (architectural)
+
+These are enforced by the network structure itself -- they cannot be violated regardless of weight values.
+
+| Constraint | Physical law | How it is enforced |
+|---|---|---|
+| **C4v crystal symmetry** | Square lattice has 4-fold rotational + mirror symmetry | Network outputs only one octant (upper triangle of one quadrant); `c4v_tile` mirrors and rotates it to fill the full NxN grid. The result is symmetric by construction. |
+| **Positive permittivity** | eps(r) > 0 everywhere for passive dielectrics | Sigmoid activation on the decoder output maps values to (0, 1), which is then linearly mapped to (eps_bg, eps_rod). Both bounds are positive. |
+| **Reciprocity / time-reversal** | omega(k) = omega(-k) for lossless media | In Mode B, wavevector k enters the network only through even functions: (kx^2, ky^2, kx*ky). This makes the output invariant under k -> -k by construction. In Mode A this is automatically satisfied by the Hermitian eigensolve. |
+| **Non-negative frequencies** | omega^2 are eigenvalues of a positive-semidefinite operator | In Mode A, inherited from `torch.linalg.eigh` on a Hermitian matrix with eigenvalue clamping. In Mode B, the output uses `softplus` (always >= 0). |
+| **Band ordering** | omega_1 <= omega_2 <= ... <= omega_n | In Mode B, the network predicts non-negative increments (via `softplus`), then `cumsum` produces monotonically ordered frequencies. In Mode A, `eigh` returns sorted eigenvalues. |
+
+### Soft constraints (loss terms)
+
+These are penalty terms in the loss function that push the solution toward physical correctness but can be partially violated during training.
+
+| Loss term | Weight flag | Purpose |
+|---|---|---|
+| **Gap width MSE** | `--w-gap` | (target_width - actual_width)^2. Drives the gap toward the desired width. |
+| **Midgap frequency MSE** | `--w-freq` | (target_freq - actual_midgap)^2. Centers the gap at the desired frequency. |
+| **Binary penalty** | `--w-binary` | mean(s * (1 - s)) where s is the normalized epsilon in [0, 1]. Pushes the design toward binary (air or solid) rather than intermediate values, which is needed for fabricability. Ramped from 10% to full value over training. |
+| **Bloch periodicity** | `--w-bloch` | MSE between opposite edges of the unit cell. Penalizes designs with boundary discontinuities. (C4v tiling already helps, but this catches residual mismatch.) |
+| **Eigenvalue residual** | `--w-residual` | \|\|Hv - lambda v\|\|^2 for eigenpairs. Directly penalizes violation of the eigenvalue equation (Maxwell's equations in Fourier space). |
+| **Variational bound** (Mode B) | `--w-variational` | Penalizes predicted frequencies that fall below the PWE ground truth, since the Rayleigh quotient provides an upper bound. |
+| **Reciprocity check** (Mode B) | `--w-reciprocity` | MSE between omega(k) and omega(-k) predictions. Redundant with the even-function encoding but adds robustness. |
+
+### Numerical stability
+
+Three guards prevent NaN during training:
+
+1. **Safe sqrt:** `torch.sqrt(clamp(x, min=1e-12))` avoids infinite gradients at the Gamma point where eigenvalues are exactly zero.
+2. **Eigenvalue jitter:** A small diagonal perturbation (1e-12 * I) is added to the Hamiltonian before `eigh` to break exact degeneracies, which cause the backward pass to produce NaN (the gradient involves 1/(lambda_i - lambda_j)).
+3. **Clamped softmax:** The smooth min/max functions clamp beta*x to [-80, 80] before `exp` to prevent overflow.
+
+If NaN is still detected in gradients, that training step is skipped and the model weights are not updated.
+
+### Adjustable parameters
+
+#### From the GUI (PINN Inverse Design section)
+
+| Parameter | Default | Description |
+|---|---|---|
+| Objective | Target | **Target**: minimise `(gap - target)^2 + (midgap - target)^2`. **Maximize gap**: maximise the gap-midgap ratio `gap/midgap` (target freq/width ignored). |
+| target freq | 0.35 | Desired midgap frequency (a/lambda). Disabled in maximize mode. |
+| target width | 0.05 | Desired gap width. Disabled in maximize mode. |
+| band lo | 0 | Lower band index for gap (0-based) |
+| band hi | 1 | Upper band index for gap |
+| steps | 200 | Training iterations |
+| lr | 0.001 | Adam learning rate |
+| latent dim | 32 | Dimensionality of the encoder's latent space |
+| w gap | 1.0 | Weight for gap width loss |
+| w freq | 1.0 | Weight for midgap frequency loss |
+| w binary | 0.1 | Weight for binarization penalty |
+| w bloch | 0.01 | Weight for Bloch periodicity penalty |
+
+The solver parameters (Grid N, PW n_max, Bands, k/seg) and material parameters (eps rod, eps bg) are shared with the PWE solver.
+
+#### CLI-only (pinn.py)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--mode` | inverse | `inverse` (Mode A) or `surrogate` (Mode B) |
+| `--maximize` | off | Flag: maximize gap-midgap ratio instead of targeting specific values |
+| `--hidden-dim` | 256 | Hidden layer width for the surrogate network |
+| `--n-fourier-features` | 64 | Number of FFT magnitude features for the surrogate encoder |
+| `--w-variational` | 0.1 | Variational bound penalty weight (Mode B) |
+| `--w-reciprocity` | 0.01 | Reciprocity check weight (Mode B) |
+
+### Usage
+
+```
+# GUI (includes PINN section)
+conda activate iqh
+python run.py
+
+# CLI -- inverse design
+python pinn.py --mode inverse --steps 300 --target-freq 0.35 --target-width 0.05
+
+# CLI -- surrogate training
+python pinn.py --mode surrogate --steps 2000
+```
+
+### Code structure
+
+#### `pwe_torch.py` -- differentiable PWE solver
+
+PyTorch port of `pwe.py` with full autograd support. Every operation (FFT, matrix inverse, `eigh`) propagates gradients back to the epsilon grid. Key additions over the NumPy version:
+
+- `_safe_sqrt` -- numerically stable sqrt with clamped input
+- Diagonal jitter on the Hamiltonian before `eigh`
+- `smooth_min` / `smooth_max` -- differentiable approximations used in the training loss (not for display)
+- `extract_gap` -- differentiable gap extraction for the loss function
+
+#### `pinn.py` -- network and training
+
+- `c4v_tile` / `C4vTiler` -- deterministic C4v symmetry expansion from octant to full grid
+- `PhysicsLoss` -- combines all soft constraint terms with configurable weights
+- `InverseDesignNet` -- MLP encoder + MLP decoder + C4v tiler + sigmoid + linear eps mapping
+- `BandSurrogate` -- Fourier feature encoder + even-k encoder + trunk MLP + softplus + cumsum
+- `train_inverse` / `train_surrogate` -- training loops with NaN detection, gradient clipping, cosine LR schedule, and binary penalty warmup
+
 References
  - Point of comparison: https://gyptis.gitlab.io/examples/modal/plot_phc2D.html
  
