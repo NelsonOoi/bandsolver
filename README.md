@@ -239,6 +239,121 @@ PyTorch port of `pwe.py` with full autograd support. Every operation (FFT, matri
 - `BandSurrogate` -- Fourier feature encoder + even-k encoder + trunk MLP + softplus + cumsum
 - `train_inverse` / `train_surrogate` -- training loops with NaN detection, gradient clipping, cosine LR schedule, and binary penalty warmup
 
+## Fourier-Space Inverse Design (`pinn_fourier.py`)
+
+A physics-embedded inverse design network that works in Fourier space. Instead of outputting pixels, the network outputs Fourier coefficients of the dielectric with C4v symmetry, and the Toeplitz matrix assembly is an explicit differentiable layer inside the network. One trained model generalizes across a range of target frequencies.
+
+### Key differences from Mode A (`pinn.py`)
+
+| | Mode A (pinn.py) | Fourier (pinn_fourier.py) |
+|---|---|---|
+| Output space | Pixels (64 values) | Fourier coefficients (~36-45 real values) |
+| Constitutive relation | External FFT | Toeplitz layer inside network |
+| Training | Single fixed target | Multi-target (sampled freq) |
+| Objective | Match target gap width | Maximize gap width at target freq |
+| Generalization | One model per target | One model for any freq in range |
+
+### Architecture
+
+```mermaid
+flowchart TD
+    input["target_freq (scalar)"]
+    enc["MLP Encoder: Linear(1→64)→ReLU→Linear(64→128)→ReLU→Linear(128→32)"]
+    dec["MLP Decoder: Linear(32→128)→ReLU→Linear(128→n_indep)"]
+    expand["C4v Fourier Expand (deterministic, no params)"]
+    toeplitz["Toeplitz Assembly: eps_mat_ij = eps_hat(G_i − G_j) (deterministic)"]
+    inv["Matrix Inverse: torch.linalg.inv (deterministic)"]
+    hamEigh["H assembly + eigh → bands (reuse _solve_bands_from_inv)"]
+    gapSelect["Splitting-aware soft gap selection across all band pairs"]
+    loss["Loss: −effective_min_split + w_freq·(effective_mid − target)² + penalties"]
+
+    input --> enc
+    enc -->|"z [32]"| dec
+    dec -->|"~45 real coeffs"| expand
+    expand -->|"eps_hat [N × N]"| toeplitz
+    toeplitz -->|"eps_mat [n_pw × n_pw]"| inv
+    inv -->|"eps_mat_inv"| hamEigh
+    hamEigh -->|"bands [n_k × n_bands]"| gapSelect
+    gapSelect -->|"effective_split, effective_mid"| loss
+```
+
+All solver steps (Toeplitz, inverse, eigh) are inside the autograd graph as deterministic layers -- the constitutive relation is embedded, not external.
+
+### Layer details
+
+| Layer | Type | Input → Output | Trainable? |
+|---|---|---|---|
+| **Encoder** | MLP | 1 → 64 → 128 → 32 | Yes |
+| **Decoder** | MLP | 32 → 128 → n_indep (~45) | Yes |
+| **DC constraint** | Sigmoid + affine | coeffs[0] → [eps_bg, eps_rod] | No (applied to decoder output) |
+| **C4v Expand** | Scatter | n_indep values → N×N Fourier grid | No (precomputed orbit indices) |
+| **IFFT** | torch.fft.ifft2 | N×N Fourier → N×N real-space | No |
+| **Toeplitz** | Index gather | N×N Fourier grid → n_pw×n_pw eps_mat | No |
+| **Matrix Inverse** | torch.linalg.inv | n_pw×n_pw → n_pw×n_pw | No |
+| **Hamiltonian + eigh** | _solve_bands_from_inv | eps_mat_inv → n_k×n_bands freqs | No |
+| **Soft gap selection** | Softmax scoring | bands → effective_split, effective_mid | No (temperature, alpha are hyperparams) |
+
+### Usage
+
+```bash
+conda activate iqh
+
+# Train (default 500 steps)
+python pinn_fourier.py train --steps 500 --lr 1e-3
+
+# Train with custom parameters
+python pinn_fourier.py train --steps 1000 --w-freq 10.0 --w-gap 2.0 --freq-lo 0.30 --freq-hi 0.40
+
+# Evaluate a saved checkpoint
+python pinn_fourier.py eval --checkpoint pinn_fourier_model.pt
+
+# Evaluate with a different frequency range
+python pinn_fourier.py eval --freq-lo 0.30 --freq-hi 0.40
+
+# Backwards-compatible (no subcommand = train)
+python pinn_fourier.py --steps 500 --lr 1e-3
+```
+
+### Training parameters
+
+| Flag | Default | Description |
+|---|---|---|
+| `--steps` | 500 | Training iterations |
+| `--lr` | 1e-3 | Adam learning rate |
+| `--n-grid` | 16 | Real-space grid size (NxN) |
+| `--n-max` | 5 | Plane wave cutoff |
+| `--n-bands` | 6 | Number of bands to compute |
+| `--n-k-seg` | 8 | k-points per BZ segment |
+| `--latent-dim` | 32 | Encoder latent dimension |
+| `--eps-bg` | 1.0 | Background permittivity |
+| `--eps-rod` | 8.9 | Rod permittivity |
+| `--freq-lo` | 0.25 | Lower bound of target frequency range |
+| `--freq-hi` | 0.45 | Upper bound of target frequency range |
+| `--w-gap` | 1.0 | Weight for gap maximization |
+| `--w-freq` | 5.0 | Weight for frequency anchoring |
+| `--w-binary` | 0.1 | Weight for binarization penalty |
+| `--w-positive` | 1.0 | Weight for positivity penalty |
+| `--temperature` | 0.05 | Softmax temperature for gap selection |
+| `--alpha` | 1.0 | Gap-size bonus in gap selection scoring |
+| `--seed` | 42 | Random seed |
+
+### Outputs
+
+- `pinn_fourier_model.pt` -- saved checkpoint (model weights, optimizer state, config, history)
+- `pinn_fourier_training.png` -- 3-panel plot: unit cell, band structure with gap, loss convergence
+- `pinn_fourier_eval.png` -- 3x3 grid of (geometry, bands) across 9 target frequencies
+- `pinn_fourier_interp.png` -- geometry morphing strip as target frequency varies smoothly
+
+### Code structure
+
+- `c4v_fourier_orbits(N)` -- computes independent Fourier coefficient orbits under C4v symmetry + reality constraint
+- `build_eps_mat_from_fourier()` -- Toeplitz matrix assembly directly from Fourier grid (skips FFT)
+- `FourierInverseNet` -- encoder + decoder + C4v scatter + IFFT visualization
+- `soft_gap_selection()` -- scores all consecutive band pairs, softmax-selects the best gap
+- `train_fourier_inverse()` -- multi-target training loop with NaN guards, cosine schedule, grad clipping
+- `evaluate_model()` -- generalization sweep + comparison table
+- `load_model()` -- reload a trained checkpoint for evaluation or downstream use
+
 References
  - Point of comparison: https://gyptis.gitlab.io/examples/modal/plot_phc2D.html
  
