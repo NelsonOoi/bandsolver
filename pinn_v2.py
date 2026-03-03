@@ -1,12 +1,19 @@
 """
-Fourier-space physics-embedded inverse design network.
+Real-space inverse design with multi-target training.
 
-Outputs Fourier coefficients of the dielectric with C4v symmetry,
-builds the Toeplitz matrix as an explicit differentiable layer,
-and trains multi-target on sampled frequencies.
+Combines pinn.py's constrained real-space parameterization (sigmoid -> [eps_bg, eps_rod])
+with pinn_fourier.py's multi-target training loop (uniform freq sampling, soft gap
+selection, periodic eval checkpoints).
+
+Key properties:
+    - Epsilon is guaranteed in [eps_bg, eps_rod] by construction (sigmoid + affine)
+    - C4v symmetry via octant tiling
+    - Automatic band-pair selection via soft_gap_selection
+    - Fourier feature embedding on target_freq input
 
 Usage:
-    python pinn_fourier.py --steps 500 --lr 1e-3 --n-grid 16 --n-max 5
+    python pinn_v2.py --steps 500 --lr 1e-3
+    python pinn_v2.py eval --checkpoint pinn_v2_model.pt
 """
 
 import argparse
@@ -21,146 +28,92 @@ if matplotlib.get_backend() == "agg":
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from pwe_torch import (reciprocal_lattice, make_k_path, _solve_bands_from_inv,
-                        extract_gap, smooth_min, smooth_max)
+from pwe_torch import (reciprocal_lattice, make_k_path, build_epsilon_matrix,
+                        solve_bands, smooth_min, smooth_max)
 
 
 # ===================================================================
-# 1. C4v Fourier Orbits
+# 1. C4v Symmetry Tiling (from pinn.py)
 # ===================================================================
 
-def c4v_fourier_orbits(N: int):
-    """Compute independent Fourier coefficient orbits under C4v symmetry.
+def c4v_tile(octant: torch.Tensor, N: int) -> torch.Tensor:
+    """Expand a triangular octant to a full NxN grid via C4v symmetry."""
+    half = N // 2
+    upper = torch.triu(octant)
+    quadrant = upper + upper.T - torch.diag(torch.diag(upper))
 
-    The C4v group on (m1, m2) mod N consists of 8 operations:
-        identity, 3 rotations (90, 180, 270), and 4 reflections.
+    top = torch.cat([quadrant.flip(1), quadrant], dim=1)
+    full = torch.cat([quadrant.flip(0).flip(1),
+                      quadrant.flip(0)], dim=1)
+    grid = torch.cat([top, full], dim=0)
+    return grid
 
-    Since the dielectric is real, eps_hat(-G) = eps_hat(G)*, and with
-    C4v symmetry all coefficients in an orbit share the same real value.
 
-    Args:
-        N: grid size (should be even).
+class C4vTiler(nn.Module):
+    def __init__(self, N: int):
+        super().__init__()
+        self.N = N
+        self.half = N // 2
 
-    Returns:
-        orbits: list of lists, each containing (i, j) tuples in the orbit.
-        n_indep: number of independent real coefficients.
-    """
-    visited = set()
-    orbits = []
-
-    for m1 in range(N):
-        for m2 in range(N):
-            if (m1, m2) in visited:
-                continue
-            orbit = set()
-            # C4v generators: 4 rotations x {identity, reflection}
-            pairs = [
-                (m1, m2), (m2, (-m1) % N),          # rot 0, 90
-                ((-m1) % N, (-m2) % N), ((-m2) % N, m1),  # rot 180, 270
-                (m2, m1), (m1, (-m2) % N),           # reflections
-                ((-m2) % N, (-m1) % N), ((-m1) % N, m2),
-            ]
-            # Also add negatives (reality constraint: eps_hat(-G) = eps_hat(G)*)
-            all_pairs = []
-            for p in pairs:
-                all_pairs.append(p)
-                all_pairs.append(((-p[0]) % N, (-p[1]) % N))
-
-            for p in all_pairs:
-                orbit.add(p)
-
-            visited.update(orbit)
-            orbits.append(sorted(orbit))
-
-    return orbits, len(orbits)
+    def forward(self, raw: torch.Tensor) -> torch.Tensor:
+        squeezed = False
+        if raw.dim() == 2:
+            raw = raw.unsqueeze(0).unsqueeze(0)
+            squeezed = True
+        B = raw.shape[0]
+        out = []
+        for b in range(B):
+            out.append(c4v_tile(raw[b, 0], self.N))
+        result = torch.stack(out)
+        if squeezed:
+            return result[0]
+        return result
 
 
 # ===================================================================
-# 2. Fourier-to-Toeplitz Layer
-# ===================================================================
-
-def build_eps_mat_from_fourier(eps_fft_grid: torch.Tensor,
-                               m_indices_np: np.ndarray):
-    """Build Toeplitz epsilon matrix directly from Fourier coefficients.
-
-    Same indexing as pwe_torch.build_epsilon_matrix but skips the FFT --
-    the Fourier grid is the direct network output.
-
-    Args:
-        eps_fft_grid: (N, N) tensor of Fourier coefficients eps_hat(m1, m2).
-        m_indices_np: (n_pw, 2) integer plane-wave indices.
-
-    Returns:
-        eps_mat: (n_pw, n_pw) complex tensor.
-    """
-    N = eps_fft_grid.shape[0]
-    dm = m_indices_np[:, None, :] - m_indices_np[None, :, :]
-    idx0 = torch.from_numpy(dm[..., 0] % N).long()
-    idx1 = torch.from_numpy(dm[..., 1] % N).long()
-    eps_mat = eps_fft_grid[idx0, idx1]
-    return eps_mat
-
-
-# ===================================================================
-# 3. Fourier Feature Embedding
+# 2. Fourier Feature Embedding
 # ===================================================================
 
 class FourierFeatureEmbedding(nn.Module):
     """Positional encoding: scalar f -> [f, sin(2πf), cos(2πf), ..., sin(2πLf), cos(2πLf)]."""
 
-    def __init__(self, n_freqs=10):
+    def __init__(self, n_freqs=3):
         super().__init__()
         self.n_freqs = n_freqs
-        # Output dim: 1 (raw) + 2 * n_freqs (sin/cos pairs)
         self.out_dim = 1 + 2 * n_freqs
         freqs = 2.0 * np.pi * torch.arange(1, n_freqs + 1, dtype=torch.float64)
         self.register_buffer("freqs", freqs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: scalar or (1,) tensor -> (out_dim,) embedding."""
         x = x.view(1).to(torch.float64)
-        phases = x * self.freqs  # (n_freqs,)
+        phases = x * self.freqs
         return torch.cat([x, torch.sin(phases), torch.cos(phases)])
 
 
 # ===================================================================
-# 4. FourierInverseNet
+# 3. InverseDesignNetV2
 # ===================================================================
 
-class FourierInverseNet(nn.Module):
-    """Maps target_freq (scalar) -> Fourier coefficients -> eps grid.
+class InverseDesignNetV2(nn.Module):
+    """Maps target_freq -> real-space epsilon grid with hard [eps_bg, eps_rod] constraint.
 
     Architecture:
-        Fourier embedding: f -> [f, sin(2πf), cos(2πf), ..., sin(2πLf), cos(2πLf)]
-        Encoder:  Linear(embed_dim->64)->ReLU->Linear(64->128)->ReLU->Linear(128->latent)
-        Decoder:  Linear(latent->128)->ReLU->Linear(128->n_indep)
-        C4v expand: scatter n_indep values into full N x N Fourier grid
-        IFFT:     N x N Fourier grid -> real-space eps grid (for visualization)
+        Fourier embedding: f -> (7D for n_freqs=3)
+        Encoder:  embed -> 64 -> 128 -> latent
+        Decoder:  latent -> 128 -> 256 -> half*half octant
+        C4v tile: octant -> full NxN grid
+        Sigmoid + affine: guarantees eps in [eps_bg, eps_rod]
     """
 
-    def __init__(self, N=16, latent_dim=32, eps_bg=1.0, eps_rod=8.9, n_embed_freqs=10):
+    def __init__(self, N=16, latent_dim=32, eps_bg=1.0, eps_rod=8.9, n_embed_freqs=3):
         super().__init__()
         self.N = N
+        self.half = N // 2
         self.eps_bg = eps_bg
         self.eps_rod = eps_rod
 
-        # Precompute C4v orbits
-        self.orbits, self.n_indep = c4v_fourier_orbits(N)
-
-        # Build scatter indices
-        flat_orbit_idx = torch.zeros(N, N, dtype=torch.long)
-        for k, orb in enumerate(self.orbits):
-            for (i, j) in orb:
-                flat_orbit_idx[i, j] = k
-        self.register_buffer("flat_orbit_idx", flat_orbit_idx)
-
-        # Find which orbit contains (0, 0) -- the DC component
-        self.dc_orbit = int(flat_orbit_idx[0, 0].item())
-
-        # Fourier feature embedding
         self.embedding = FourierFeatureEmbedding(n_embed_freqs)
 
-        # Encoder (takes embedding instead of raw scalar)
         self.encoder = nn.Sequential(
             nn.Linear(self.embedding.out_dim, 64),
             nn.ReLU(),
@@ -169,63 +122,43 @@ class FourierInverseNet(nn.Module):
             nn.Linear(128, latent_dim),
         )
 
-        # Decoder
+        octant_pixels = self.half * self.half
         self.decoder = nn.Sequential(
             nn.Linear(latent_dim, 128),
             nn.ReLU(),
-            nn.Linear(128, self.n_indep),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, octant_pixels),
         )
 
-    def forward(self, target_freq: torch.Tensor):
-        """Generate Fourier coefficient grid and real-space grid.
+        self.tiler = C4vTiler(N)
 
-        Args:
-            target_freq: scalar tensor.
+    def forward(self, target_freq: torch.Tensor):
+        """Generate epsilon grid from target frequency.
 
         Returns:
-            eps_fft_grid: (N, N) complex tensor of Fourier coefficients.
-            eps_grid: (N, N) real tensor from IFFT (for visualization/penalties).
+            eps_grid: (N, N) with values in [eps_bg, eps_rod].
+            eps_norm: (N, N) with values in [0, 1].
         """
         x_embed = self.embedding(target_freq)
         z = self.encoder(x_embed)
-        coeffs = self.decoder(z)  # (n_indep,)
+        raw = self.decoder(z).view(self.half, self.half)
 
-        # DC component: sigmoid -> affine to [eps_bg, eps_rod]
-        dc_val = torch.sigmoid(coeffs[self.dc_orbit])
-        dc_val = self.eps_bg + (self.eps_rod - self.eps_bg) * dc_val
+        eps_norm = torch.sigmoid(raw)
+        eps_norm_full = self.tiler(eps_norm)
 
-        # Build full N x N grid by scattering orbit values
-        grid_flat = coeffs[self.flat_orbit_idx]  # (N, N)
-
-        # Override DC orbit with constrained value
-        dc_mask = (self.flat_orbit_idx == self.dc_orbit)
-        grid_flat = torch.where(dc_mask, dc_val.expand_as(grid_flat), grid_flat)
-
-        eps_fft_grid = grid_flat.to(torch.complex128)
-
-        # Real-space via IFFT (for visualization and penalties)
-        eps_grid = torch.fft.ifft2(eps_fft_grid * (self.N * self.N)).real
-
-        return eps_fft_grid, eps_grid
+        eps_grid = self.eps_bg + (self.eps_rod - self.eps_bg) * eps_norm_full
+        return eps_grid, eps_norm_full
 
 
 # ===================================================================
-# 5. Splitting-Aware Soft Gap Selection
+# 4. Splitting-Aware Soft Gap Selection (from pinn_fourier.py)
 # ===================================================================
 
 def soft_gap_selection(bands: torch.Tensor, target_freq: float,
                        temperature: float = 0.05, alpha: float = 1.0,
                        beta: float = 50.0):
     """Select the most promising band gap across all consecutive pairs.
-
-    For each consecutive pair (n, n+1):
-        - split_n(k) = band_{n+1}(k) - band_n(k)
-        - avg_split = mean over k
-        - min_split = smooth_min over k
-        - mid_n = 0.5 * mean(band_{n+1} + band_n)
-        - score = -|mid - target| / temperature + alpha * avg_split
-
-    Softmax over scores yields weights w_n for soft selection.
 
     Returns:
         effective_split: weighted min-split across band pairs.
@@ -240,7 +173,7 @@ def soft_gap_selection(bands: torch.Tensor, target_freq: float,
     mids = []
 
     for n in range(n_pairs):
-        split_k = bands[:, n + 1] - bands[:, n]  # (n_k,)
+        split_k = bands[:, n + 1] - bands[:, n]
         avg_s = split_k.mean()
         min_s = smooth_min(split_k, beta=-beta)
         mid = 0.5 * (bands[:, n + 1] + bands[:, n]).mean()
@@ -253,7 +186,6 @@ def soft_gap_selection(bands: torch.Tensor, target_freq: float,
     min_splits = torch.stack(min_splits)
     mids = torch.stack(mids)
 
-    # Score: prefer pairs close to target with large splits
     freq_dist = torch.abs(mids - target_freq)
     scores = -freq_dist / temperature + alpha * avg_splits
     scores = torch.clamp(scores, min=-80.0, max=80.0)
@@ -266,22 +198,20 @@ def soft_gap_selection(bands: torch.Tensor, target_freq: float,
 
 
 # ===================================================================
-# 6. Eval Checkpoint (periodic during training)
+# 5. Eval Checkpoint
 # ===================================================================
 
 def _run_eval_checkpoint(model, cfg, g_vectors, m_indices, k_points, n_test=5):
-    """Quick eval on fixed test frequencies. Returns dict of metrics."""
+    """Quick eval on fixed test frequencies."""
     test_freqs = np.linspace(cfg.freq_lo, cfg.freq_hi, n_test)
     gaps, mid_errors = [], []
 
     for tf in test_freqs:
         tf_t = torch.tensor(tf, dtype=torch.float64)
         with torch.no_grad():
-            eps_fft, eps_grid = model(tf_t)
-            eps_mat = build_eps_mat_from_fourier(eps_fft, m_indices)
-            eps_mat_inv = torch.linalg.inv(eps_mat)
-            bands = _solve_bands_from_inv(k_points, g_vectors, eps_mat_inv,
-                                          cfg.n_bands, "tm")
+            eps_grid, _ = model(tf_t)
+            bands = solve_bands(k_points, g_vectors, eps_grid, m_indices,
+                                cfg.n_bands, "tm")
         bands_np = bands.detach().cpu().numpy()
         best_gw, best_mid = 0.0, 0.0
         for n in range(bands_np.shape[1] - 1):
@@ -304,18 +234,18 @@ def _run_eval_checkpoint(model, cfg, g_vectors, m_indices, k_points, n_test=5):
 
 
 # ===================================================================
-# 7. Training Loop
+# 6. Training Loop
 # ===================================================================
 
-def train_fourier_inverse(cfg):
-    """Multi-target training with curriculum and periodic eval checkpoints."""
+def train(cfg):
+    """Multi-target training with soft gap selection and periodic eval."""
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
 
     g_vectors, m_indices = reciprocal_lattice(cfg.n_max)
     k_points, k_dist, tick_pos, tick_labels = make_k_path(cfg.n_k_seg)
 
-    model = FourierInverseNet(
+    model = InverseDesignNetV2(
         N=cfg.n_grid, latent_dim=cfg.latent_dim,
         eps_bg=cfg.eps_bg, eps_rod=cfg.eps_rod,
         n_embed_freqs=cfg.n_embed_freqs,
@@ -324,17 +254,16 @@ def train_fourier_inverse(cfg):
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, cfg.steps)
 
-    # Binary penalty warmup
     binary_schedule = np.linspace(cfg.w_binary * 0.1, cfg.w_binary, cfg.steps)
 
     history = []
-    eval_history = []  # periodic eval checkpoints
+    eval_history = []
     eval_interval = max(1, cfg.steps // 10)
 
-    print(f"Fourier Inverse Design | Grid: {cfg.n_grid} | Steps: {cfg.steps}")
+    print(f"Inverse Design v2 | Grid: {cfg.n_grid} | Steps: {cfg.steps}")
     print(f"Target freq range: [{cfg.freq_lo:.3f}, {cfg.freq_hi:.3f}]")
-    print(f"Fourier embedding freqs: {cfg.n_embed_freqs} ({model.embedding.out_dim}D input)")
-    print(f"Independent Fourier coefficients: {model.n_indep}")
+    print(f"Epsilon range: [{cfg.eps_bg:.1f}, {cfg.eps_rod:.1f}] (hard constraint)")
+    print(f"Fourier embedding: {cfg.n_embed_freqs} freqs ({model.embedding.out_dim}D)")
     print(f"Eval checkpoint every {eval_interval} steps")
     print("-" * 60)
 
@@ -342,39 +271,28 @@ def train_fourier_inverse(cfg):
         t0 = time.time()
         optimizer.zero_grad()
 
-        # Uniform sampling over full freq range
         target_freq = cfg.freq_lo + (cfg.freq_hi - cfg.freq_lo) * np.random.rand()
         target_freq_t = torch.tensor(target_freq, dtype=torch.float64)
 
         w_bin = float(binary_schedule[step])
 
-        # Forward pass (all inside autograd graph)
-        eps_fft, eps_grid = model(target_freq_t)
-        eps_mat = build_eps_mat_from_fourier(eps_fft, m_indices)
-        eps_mat_inv = torch.linalg.inv(eps_mat)
-        bands = _solve_bands_from_inv(k_points, g_vectors, eps_mat_inv,
-                                      cfg.n_bands, "tm")
+        eps_grid, eps_norm = model(target_freq_t)
+        bands = solve_bands(k_points, g_vectors, eps_grid, m_indices,
+                            cfg.n_bands, "tm")
 
-        # Splitting-aware gap selection
         eff_split, eff_mid, gap_weights = soft_gap_selection(
             bands, target_freq, temperature=cfg.temperature, alpha=cfg.alpha
         )
 
-        loss_gap = -cfg.w_gap * eff_split
+        safe_mid = torch.clamp(eff_mid, min=1e-6)
+        loss_gap = -cfg.w_gap * (eff_split / safe_mid)
         loss_freq = cfg.w_freq * (eff_mid - target_freq) ** 2
-
-        # Binary penalty on real-space grid
-        eps_norm = (eps_grid - eps_grid.min()) / (eps_grid.max() - eps_grid.min() + 1e-8)
         loss_binary = w_bin * torch.mean(eps_norm * (1.0 - eps_norm))
 
-        # Positivity penalty
-        loss_positive = cfg.w_positive * torch.mean(F.relu(-eps_grid))
-
-        total_loss = loss_gap + loss_freq + loss_binary + loss_positive
+        total_loss = loss_gap + loss_freq + loss_binary
 
         total_loss.backward()
 
-        # NaN guard
         has_nan = any(
             p.grad is not None and torch.isnan(p.grad).any()
             for p in model.parameters()
@@ -405,6 +323,8 @@ def train_fourier_inverse(cfg):
             "gap": eff_split.item(),
             "mid": eff_mid.item(),
             "target": target_freq,
+            "eps_min": eps_grid.min().item(),
+            "eps_max": eps_grid.max().item(),
             "time": elapsed,
             "nan": False,
         }
@@ -415,9 +335,9 @@ def train_fourier_inverse(cfg):
             print(f"[{step+1:4d}/{cfg.steps}] loss={info['total']:.5f}  "
                   f"gap={info['gap']:.5f}  mid={info['mid']:.4f}  "
                   f"tgt={target_freq:.4f}  pair={best_pair}-{best_pair+1}  "
+                  f"eps=[{info['eps_min']:.1f},{info['eps_max']:.1f}]  "
                   f"({elapsed:.2f}s)")
 
-        # Periodic eval checkpoint
         if (step + 1) % eval_interval == 0:
             ev = _run_eval_checkpoint(model, cfg, g_vectors, m_indices, k_points)
             ev["step"] = step
@@ -425,8 +345,7 @@ def train_fourier_inverse(cfg):
             print(f"  >> EVAL  mean_gap={ev['mean_gap']:.5f}  "
                   f"mean_mid_err={ev['mean_mid_err']:.5f}")
 
-    # Save checkpoint
-    ckpt_path = "pinn_fourier_model.pt"
+    ckpt_path = "pinn_v2_model.pt"
     torch.save({
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
@@ -437,7 +356,6 @@ def train_fourier_inverse(cfg):
     }, ckpt_path)
     print(f"Saved checkpoint to {ckpt_path}")
 
-    # Final evaluation
     print("\n" + "=" * 60)
     print("Evaluation")
     print("=" * 60)
@@ -446,31 +364,30 @@ def train_fourier_inverse(cfg):
 
 
 # ===================================================================
-# 8. Evaluation
+# 7. Evaluation
 # ===================================================================
 
 def evaluate_model(model, cfg, g_vectors, m_indices, k_points, k_dist,
                    tick_pos, tick_labels, history, eval_history=None):
-    """Generalization sweep, interpolation demo, comparison plots."""
     if eval_history is None:
         eval_history = []
 
     test_freqs = np.linspace(cfg.freq_lo, cfg.freq_hi, 9)
     results = []
 
-    print(f"{'target':>8s}  {'gap_width':>9s}  {'midgap':>8s}  {'best_pair':>9s}")
-    print("-" * 40)
+    print(f"{'target':>8s}  {'gap_width':>9s}  {'midgap':>8s}  {'best_pair':>9s}  "
+          f"{'eps_min':>7s}  {'eps_max':>7s}")
+    print("-" * 58)
 
     for tf in test_freqs:
         tf_t = torch.tensor(tf, dtype=torch.float64)
         with torch.no_grad():
-            eps_fft, eps_grid = model(tf_t)
-            eps_mat = build_eps_mat_from_fourier(eps_fft, m_indices)
-            eps_mat_inv = torch.linalg.inv(eps_mat)
-            bands = _solve_bands_from_inv(k_points, g_vectors, eps_mat_inv,
-                                          cfg.n_bands, "tm")
+            eps_grid, eps_norm = model(tf_t)
+            bands = solve_bands(k_points, g_vectors, eps_grid, m_indices,
+                                cfg.n_bands, "tm")
 
         bands_np = bands.detach().cpu().numpy()
+        eps_np = eps_grid.detach().cpu().numpy()
         best_gw, best_mid, best_pair = 0.0, 0.0, 0
         for n in range(bands_np.shape[1] - 1):
             floor_n = np.max(bands_np[:, n])
@@ -487,11 +404,11 @@ def evaluate_model(model, cfg, g_vectors, m_indices, k_points, k_dist,
             "midgap": best_mid,
             "best_pair": best_pair,
             "bands": bands_np,
-            "eps_grid": eps_grid.detach().cpu().numpy(),
+            "eps_grid": eps_np,
         })
-        print(f"{tf:8.4f}  {best_gw:9.5f}  {best_mid:8.4f}  {best_pair:5d}-{best_pair+1}")
+        print(f"{tf:8.4f}  {best_gw:9.5f}  {best_mid:8.4f}  {best_pair:5d}-{best_pair+1}"
+              f"  {eps_np.min():7.2f}  {eps_np.max():7.2f}")
 
-    # Plots
     _plot_training(results, history, eval_history, k_dist, tick_pos, tick_labels, cfg)
     _plot_evaluation_grid(results, k_dist, tick_pos, tick_labels, cfg)
     _plot_interpolation(model, cfg, m_indices, g_vectors, k_points,
@@ -499,17 +416,15 @@ def evaluate_model(model, cfg, g_vectors, m_indices, k_points, k_dist,
 
 
 # ===================================================================
-# 9. Plotting
+# 8. Plotting
 # ===================================================================
 
 def _plot_training(results, history, eval_history, k_dist, tick_pos, tick_labels, cfg):
-    """4-panel training plot: eps_grid, bands, per-step loss, eval convergence."""
     mid_res = results[len(results) // 2]
 
     n_panels = 4 if eval_history else 3
     fig, axes = plt.subplots(1, n_panels, figsize=(4.5 * n_panels, 4.5))
 
-    # Panel 1: epsilon grid
     ax = axes[0]
     im = ax.imshow(mid_res["eps_grid"].T, origin="lower",
                    extent=[0, 1, 0, 1], cmap="RdYlBu_r")
@@ -517,7 +432,6 @@ def _plot_training(results, history, eval_history, k_dist, tick_pos, tick_labels
     ax.set_title(f"Unit cell (f_tgt={mid_res['target']:.3f})")
     ax.set_xlabel("x/a"); ax.set_ylabel("y/a"); ax.set_aspect("equal")
 
-    # Panel 2: band structure
     ax = axes[1]
     bands_np = mid_res["bands"]
     for i in range(bands_np.shape[1]):
@@ -534,14 +448,12 @@ def _plot_training(results, history, eval_history, k_dist, tick_pos, tick_labels
         ax.axhspan(floor_v, ceil_v, alpha=0.15, color="#2563eb")
     ax.axhline(mid_res["target"], color="red", linewidth=0.7, linestyle=":")
 
-    # Panel 3: per-step loss (noisy, for reference)
     ax = axes[2]
     valid = [h for h in history if not h["nan"]]
     if valid:
         steps = [h["step"] for h in valid]
         ax.plot(steps, [h["total"] for h in valid], label="total",
                 linewidth=0.4, alpha=0.5)
-        # Rolling average
         window = max(1, len(valid) // 20)
         if len(valid) > window:
             totals = np.array([h["total"] for h in valid])
@@ -551,7 +463,6 @@ def _plot_training(results, history, eval_history, k_dist, tick_pos, tick_labels
     ax.set_xlabel("step"); ax.set_ylabel("loss"); ax.set_title("Per-step loss")
     ax.legend(fontsize=8); ax.set_yscale("symlog", linthresh=1e-4)
 
-    # Panel 4: eval checkpoint convergence
     if eval_history:
         ax = axes[3]
         ev_steps = [e["step"] for e in eval_history]
@@ -567,13 +478,12 @@ def _plot_training(results, history, eval_history, k_dist, tick_pos, tick_labels
         ax2.legend(loc="upper right", fontsize=8)
 
     fig.tight_layout()
-    fig.savefig("pinn_fourier_training.png", dpi=150)
-    print(f"Saved pinn_fourier_training.png")
+    fig.savefig("pinn_v2_training.png", dpi=150)
+    print("Saved pinn_v2_training.png")
     plt.close(fig)
 
 
 def _plot_evaluation_grid(results, k_dist, tick_pos, tick_labels, cfg):
-    """3x3 grid of (geometry, bands) for different target frequencies."""
     n = len(results)
     cols = min(3, n)
     rows = (n + cols - 1) // cols
@@ -585,15 +495,14 @@ def _plot_evaluation_grid(results, k_dist, tick_pos, tick_labels, cfg):
     for idx, res in enumerate(results):
         r, c = divmod(idx, cols)
 
-        # Geometry
         ax = axes[r, c * 2]
         im = ax.imshow(res["eps_grid"].T, origin="lower",
-                       extent=[0, 1, 0, 1], cmap="RdYlBu_r")
+                       extent=[0, 1, 0, 1], cmap="RdYlBu_r",
+                       vmin=cfg.eps_bg, vmax=cfg.eps_rod)
         ax.set_title(f"f={res['target']:.3f}", fontsize=9)
         ax.set_aspect("equal")
         ax.tick_params(labelsize=7)
 
-        # Bands
         ax = axes[r, c * 2 + 1]
         for i in range(res["bands"].shape[1]):
             ax.plot(k_dist, res["bands"][:, i], color="#2563eb", linewidth=0.7)
@@ -608,21 +517,19 @@ def _plot_evaluation_grid(results, k_dist, tick_pos, tick_labels, cfg):
         ax.set_title(f"gap={res['gap_width']:.4f}", fontsize=9)
         ax.tick_params(labelsize=7)
 
-    # Hide unused axes
     for idx in range(n, rows * cols):
         r, c = divmod(idx, cols)
         axes[r, c * 2].axis("off")
         axes[r, c * 2 + 1].axis("off")
 
     fig.tight_layout()
-    fig.savefig("pinn_fourier_eval.png", dpi=150)
-    print(f"Saved pinn_fourier_eval.png")
+    fig.savefig("pinn_v2_eval.png", dpi=150)
+    print("Saved pinn_v2_eval.png")
     plt.close(fig)
 
 
 def _plot_interpolation(model, cfg, m_indices, g_vectors, k_points,
                         k_dist, tick_pos, tick_labels):
-    """Row of geometries at smoothly interpolated target frequencies."""
     n_interp = 8
     freqs = np.linspace(cfg.freq_lo, cfg.freq_hi, n_interp)
 
@@ -631,34 +538,34 @@ def _plot_interpolation(model, cfg, m_indices, g_vectors, k_points,
     for i, f in enumerate(freqs):
         tf_t = torch.tensor(f, dtype=torch.float64)
         with torch.no_grad():
-            _, eps_grid = model(tf_t)
+            eps_grid, _ = model(tf_t)
         eps_np = eps_grid.detach().cpu().numpy()
 
         ax = axes[i]
-        ax.imshow(eps_np.T, origin="lower", extent=[0, 1, 0, 1], cmap="RdYlBu_r")
+        ax.imshow(eps_np.T, origin="lower", extent=[0, 1, 0, 1], cmap="RdYlBu_r",
+                  vmin=cfg.eps_bg, vmax=cfg.eps_rod)
         ax.set_title(f"f={f:.3f}", fontsize=9)
         ax.set_aspect("equal")
         ax.tick_params(labelsize=6)
 
     fig.suptitle("Interpolation: geometry vs target frequency", fontsize=11)
     fig.tight_layout()
-    fig.savefig("pinn_fourier_interp.png", dpi=150)
-    print(f"Saved pinn_fourier_interp.png")
+    fig.savefig("pinn_v2_interp.png", dpi=150)
+    print("Saved pinn_v2_interp.png")
     plt.close(fig)
 
 
 # ===================================================================
-# 10. CLI
+# 9. CLI
 # ===================================================================
 
-def load_model(checkpoint="pinn_fourier_model.pt"):
-    """Load a trained model from checkpoint."""
+def load_model(checkpoint="pinn_v2_model.pt"):
     ckpt = torch.load(checkpoint, map_location="cpu")
     c = ckpt["cfg"]
-    model = FourierInverseNet(
+    model = InverseDesignNetV2(
         N=c["n_grid"], latent_dim=c["latent_dim"],
         eps_bg=c["eps_bg"], eps_rod=c["eps_rod"],
-        n_embed_freqs=c.get("n_embed_freqs", 10),
+        n_embed_freqs=c.get("n_embed_freqs", 3),
     ).double()
     model.load_state_dict(ckpt["model_state"])
     model.eval()
@@ -666,7 +573,6 @@ def load_model(checkpoint="pinn_fourier_model.pt"):
 
 
 def eval_from_checkpoint(cfg):
-    """Load checkpoint and run evaluation/plots."""
     model, ckpt = load_model(cfg.checkpoint)
     saved_cfg = argparse.Namespace(**ckpt["cfg"])
     history = ckpt.get("history", [])
@@ -685,10 +591,9 @@ def eval_from_checkpoint(cfg):
 
 
 def _add_train_args(parser):
-    """Add training arguments to a parser."""
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--n-grid", type=int, default=16)
+    parser.add_argument("--n-grid", type=int, default=32)
     parser.add_argument("--n-max", type=int, default=5)
     parser.add_argument("--n-bands", type=int, default=6)
     parser.add_argument("--n-k-seg", type=int, default=8)
@@ -698,44 +603,36 @@ def _add_train_args(parser):
     parser.add_argument("--freq-lo", type=float, default=0.25)
     parser.add_argument("--freq-hi", type=float, default=0.45)
     parser.add_argument("--w-gap", type=float, default=1.0)
-    parser.add_argument("--w-freq", type=float, default=5.0)
+    parser.add_argument("--w-freq", type=float, default=20.0)
     parser.add_argument("--w-binary", type=float, default=0.1)
-    parser.add_argument("--w-positive", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=0.05)
     parser.add_argument("--alpha", type=float, default=1.0)
-    parser.add_argument("--n-embed-freqs", type=int, default=3,
-                        help="Fourier embedding frequencies for target_freq input")
+    parser.add_argument("--n-embed-freqs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
 
 
 def main():
     import sys
 
-    # Check if first arg is a subcommand
     if len(sys.argv) > 1 and sys.argv[1] in ("train", "eval"):
-        p = argparse.ArgumentParser(
-            description="Fourier-space physics-embedded inverse design network"
-        )
+        p = argparse.ArgumentParser(description="Real-space inverse design v2")
         sub = p.add_subparsers(dest="command")
-        tr = sub.add_parser("train", help="Train the model")
+        tr = sub.add_parser("train")
         _add_train_args(tr)
-        ev = sub.add_parser("eval", help="Evaluate a saved checkpoint")
-        ev.add_argument("--checkpoint", type=str, default="pinn_fourier_model.pt")
+        ev = sub.add_parser("eval")
+        ev.add_argument("--checkpoint", type=str, default="pinn_v2_model.pt")
         ev.add_argument("--freq-lo", type=float, default=None)
         ev.add_argument("--freq-hi", type=float, default=None)
         cfg = p.parse_args()
         if cfg.command == "eval":
             eval_from_checkpoint(cfg)
         else:
-            train_fourier_inverse(cfg)
+            train(cfg)
     else:
-        # No subcommand -- backwards compat, treat as train
-        p = argparse.ArgumentParser(
-            description="Fourier-space physics-embedded inverse design network"
-        )
+        p = argparse.ArgumentParser(description="Real-space inverse design v2")
         _add_train_args(p)
         cfg = p.parse_args()
-        train_fourier_inverse(cfg)
+        train(cfg)
 
 
 if __name__ == "__main__":
