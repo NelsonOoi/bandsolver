@@ -1,0 +1,10 @@
+--- Photonic test metrics ---
+               DualGridCANN  RMSE=0.020731
+         DualGridCANN_cross  RMSE=0.012006
+          GridCANN baseline  RMSE=0.021905
+
+--- Phononic test metrics ---
+               DualGridCANN  RMSE=749.139404
+         DualGridCANN_cross  RMSE=650.911011
+
+--- Parameter counts ---
