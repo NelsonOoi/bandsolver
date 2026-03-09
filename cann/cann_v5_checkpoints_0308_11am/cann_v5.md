@@ -204,7 +204,15 @@ $$\mathcal{L}*{\mathrm{phot}} = \frac{1}{BN_kN_b^p} \sum*{i,j,n} \left(\hat{z}^p
 
 $$\mathcal{L}*{\mathrm{phon}} = \frac{1}{BN_kN_b^n} \sum*{i,j,n} \left(\hat{z}^n_{ijn} - z^n_{ijn}\right)^2, \qquad z^n_{ijn} = \frac{\omega^n_{ijn} - \mu^n_{jn}}{\sigma^n_{jn}}$$
 
-Here $\mu_{jn}$ and $\sigma_{jn}$ are the per-(k-point, band) mean and standard deviation computed from the training set. This standardization ensures all targets have comparable scale regardless of whether they are photonic ($\sim 0.1$) or phononic ($\sim 10^3$–$10^4$), and regardless of which band or k-point.
+Here $\mu_{jn}$ and $\sigma_{jn}$ are the per-(k-point, band) mean and standard deviation computed once from the training set before training begins. This standardization ensures all targets have comparable scale regardless of whether they are photonic ($\sim 0.1$) or phononic ($\sim 10^3$–$10^4$), and regardless of which band or k-point.
+
+**Equivalence to weighted MSE.** Since standardization is a fixed linear transformation $z = (\omega - \mu)/\sigma$, minimizing the loss in standardized space is equivalent to minimizing a weighted MSE in the original frequency space:
+
+$$\mathcal{L} = \sum_{j,n} \frac{1}{\sigma_{jn}^2}\left(\hat{\omega}_{jn} - \omega_{jn}\right)^2$$
+
+The global minimum ($\hat{\omega} = \omega$) is the same regardless of the weighting. The standardization only changes the optimization landscape — how fast the network converges on each band. Bands with small variance $\sigma_{jn}$ (e.g., low-frequency acoustic bands) are upweighted, receiving larger gradients for the same absolute error. Bands with large variance (e.g., high-frequency optical bands) are downweighted. This prevents the gradient from being dominated by the highest-magnitude bands and ensures equal relative accuracy across all bands.
+
+**Validity.** Dividing by $\sigma_{jn}$ is valid because $\mu_{jn}$ and $\sigma_{jn}$ are fixed scalars computed once from the training set — no different from choosing different units (e.g., GHz instead of Hz). They do not depend on the model's predictions (no data leakage) and are not recomputed per batch (no moving target).
 
 **Regularization.** No explicit regularization term. Implicit regularization via:
 
@@ -285,7 +293,27 @@ RMSE penalizes large errors more heavily than MAE and is in the same units as th
 
 $$\mathrm{RMSE}*n = \sqrt{\frac{1}{N*{\mathrm{test}}N_k} \sum_{i=1}^{N_{\mathrm{test}}} \sum_{j=1}^{N_k} \left(\hat{\omega}*{ijn} - \omega*{ijn}\right)^2}$$
 
-This reveals whether higher-frequency bands (which have more complex dispersion) are systematically harder.
+This reveals whether higher-frequency bands (which have more complex dispersion) are systematically harder. The overall and per-band RMSE are related by:
+
+$$\mathrm{RMSE}_{\mathrm{overall}} = \sqrt{\frac{1}{N_b}\sum_{n=1}^{N_b} \mathrm{RMSE}_n^2}$$
+
+**Distinction from the loss function.** Both the loss and RMSE have the same MSE form, but they measure different things. The loss operates on standardized targets $z$ (weighted by $1/\sigma_{jn}^2$), optimizing for equal **relative** accuracy across bands. The RMSE is computed on original-scale frequencies $\omega$ with uniform weighting, reporting **absolute** accuracy in physical units ($\omega a/2\pi c$ for photonic, Hz·$a$ for phononic).
+
+**Normalized RMSE (NRMSE).** Expresses error as a fraction of the target frequency range, enabling comparison across physics:
+
+$$\mathrm{NRMSE} = \frac{\mathrm{RMSE}}{\omega_{\max} - \omega_{\min}}$$
+
+**Coefficient of Variation of RMSE (CV-RMSE).** Expresses error as a fraction of the mean target frequency — the standard "percentage error" interpretation:
+
+$$\mathrm{CV\text{-}RMSE} = \frac{\mathrm{RMSE}}{\bar{\omega}}$$
+
+CV-RMSE is always larger than NRMSE (since $\bar{\omega} < \omega_{\max} - \omega_{\min}$) and is more commonly used in the literature. Both allow direct comparison of photonic and phononic accuracy on a common dimensionless scale.
+
+**Per-band relative RMSE.** Normalizes each band's RMSE by its own mean frequency:
+
+$$\mathrm{rRMSE}_n = \frac{\mathrm{RMSE}_n}{\bar{\omega}_n}$$
+
+This reveals whether the network achieves uniform relative accuracy across bands or struggles disproportionately with specific bands.
 
 **Qualitative: band diagram overlay.** Side-by-side plots of predicted (dashed red) vs. ground truth (solid black) band structures for selected test geometries, providing visual assessment of band crossing accuracy and gap prediction.
 
