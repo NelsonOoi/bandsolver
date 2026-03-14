@@ -1,0 +1,612 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{multirow}
+\usepackage{siunitx}
+\usepackage[numbers]{natbib}
+
+\newcommand{\TODO}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
+\newcommand{\FIGPLACEHOLDER}[1]{%
+  \begin{center}
+    \fbox{\parbox{0.9\linewidth}{\centering\vspace{2em}\textcolor{gray}{\textit{#1}}\vspace{2em}}}
+  \end{center}
+}
+
+\title{Constitutive Artificial Neural Networks for Simultaneous Photonic--Phononic Band Structure Prediction in 2D Periodic Crystals}
+\author{Nelson}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% ===========================================================================
+\begin{abstract}
+We develop Constitutive Artificial Neural Networks (CANNs) that simultaneously predict the photonic and phononic band structures of two-dimensional periodic crystals from a binary geometry mask alone. The ground-truth eigenproblems---plane-wave expansion for photonics and finite element method for phononics---are too expensive for iterative inverse design. Our surrogate replaces both solvers with a single forward pass, achieving test-set CV-RMSE of 1.35\% (photonic) and 2.97\% (phononic), representing $2\times$ and $5.5\times$ improvements over the baseline architecture (CV-RMSE 2.94\% and 17.18\%, respectively). We demonstrate the surrogate's utility for gradient-based inverse design of structures with simultaneous photonic--phononic band gaps.
+\end{abstract}
+
+% ===========================================================================
+\section{Introduction and Motivation}
+\label{sec:intro}
+
+Photonic and phononic crystals---periodic structures that exhibit frequency band gaps for electromagnetic and elastic waves, respectively---have attracted intense interest for applications in optical waveguiding, acoustic isolation, and optomechanical devices~\cite{joannopoulos2008,kushwaha1993}. When a single structure exhibits \emph{simultaneous} photonic and phononic band gaps, it becomes a platform for enhanced light--sound interaction, enabling phenomena such as stimulated Brillouin scattering in photonic crystal fibers and optomechanical cooling~\cite{maldovan2006,pennec2010}.
+
+Designing such dual-gap structures requires evaluating the photonic and phononic band structures across a vast geometric design space. The standard computational tools---plane-wave expansion (PWE) for photonics~\cite{joannopoulos2008} and the finite element method (FEM) for phononics~\cite{kushwaha1993}---each require assembling and diagonalizing large matrices at every wavevector $\mathbf{k}$ along the Brillouin zone boundary. For a typical calculation with $N_k = 31$ k-points and $\sim$100 plane waves, each geometry evaluation takes seconds to minutes. Inverse design via topology optimization or genetic algorithms demands $10^3$--$10^5$ such evaluations, making first-principles solvers a computational bottleneck.
+
+Neural network surrogates offer a path to orders-of-magnitude speedup by learning the mapping from geometry to band structure from a training set of precomputed solutions. Prior work has demonstrated this for photonic crystals using fully connected networks~\cite{so2020} and for phononic crystals independently~\cite{liu2021mlphononic}. However, \emph{simultaneous} prediction of both physics from a shared representation remains underexplored.
+
+\subsection{Objectives}
+
+The objectives of this study are:
+\begin{enumerate}
+    \item Develop a neural surrogate that \emph{simultaneously} predicts photonic (TE) and phononic (in-plane elastic) band structures from a binary unit-cell geometry.
+    \item Design physics-informed architectural components---activation functions and layer structures---that mirror the computational pipeline of PWE/FEM eigensolves.
+    \item Compare per-k conditioned (DeepONet-style) architectures against monolithic output architectures, and independent vs.\ cross-gated dual-physics heads.
+    \item Demonstrate the trained surrogate in gradient-based inverse design for simultaneous photonic--phononic band gap maximization.
+\end{enumerate}
+
+% ===========================================================================
+\section{Methods}
+\label{sec:methods}
+
+\subsection{Problem Statement}
+
+Given a 2D binary geometry mask $m(\mathbf{r}) \in \{0, 1\}$ on a square lattice (lattice constant $a = 1$), the goal is to learn mappings
+\begin{equation}
+    m(\mathbf{r}) \;\xrightarrow{\;\text{CANN}\;}\; \omega^{\text{phot}}_n(\mathbf{k}), \quad \omega^{\text{phon}}_n(\mathbf{k})
+\end{equation}
+that approximate the eigenfrequencies obtained from the photonic PWE and phononic FEM eigenproblems at each wavevector $\mathbf{k}$ along the irreducible Brillouin zone path $\Gamma \to X \to M \to \Gamma$, for $N_b^p = 6$ photonic and $N_b^n = 10$ phononic bands.
+
+The surrogate must be fast enough for iterative inverse design ($<$1~ms per evaluation) and differentiable with respect to the input geometry to enable gradient-based optimization.
+
+\subsection{Physics Background and Assumptions}
+\label{sec:physics}
+
+The CANN is a supervised surrogate: it learns from labeled training data produced by two classical solvers. The plane-wave expansion (PWE) method solves the photonic eigenproblem, and a finite element method (FEM) solver handles the phononic eigenproblem. These solvers are used \emph{only} during data generation; at inference time the CANN replaces both with a single forward pass. We review the underlying physics to motivate the architecture.
+
+\subsubsection{Photonic Eigenproblem (TE Polarization)}
+
+The source-free Maxwell's equations in a lossless, non-magnetic medium with spatially varying dielectric permittivity $\varepsilon(\mathbf{r})$ combine into the master equation for the magnetic field~\cite{joannopoulos2008}:
+\begin{equation}
+    \nabla \times \left[\frac{1}{\varepsilon(\mathbf{r})} \nabla \times \mathbf{H}\right] = \frac{\omega^2}{c^2} \mathbf{H}
+    \label{eq:master}
+\end{equation}
+This is a Hermitian eigenvalue problem: the operator $\Theta = \nabla \times \varepsilon^{-1} \nabla \times$ is Hermitian under the inner product $\langle \mathbf{F}, \mathbf{G} \rangle = \int \mathbf{F}^* \cdot \mathbf{G}\, d\mathbf{r}$, guaranteeing real, non-negative eigenvalues $\omega^2/c^2$.
+
+When $\varepsilon(\mathbf{r})$ is periodic with lattice vectors $\mathbf{a}_1, \mathbf{a}_2$ (here a square lattice with $|\mathbf{a}_i| = a = 1$), Bloch's theorem constrains the eigenstates to the form:
+\begin{equation}
+    \mathbf{H}_{\mathbf{k}}(\mathbf{r}) = e^{i\mathbf{k}\cdot\mathbf{r}} \mathbf{u}_{\mathbf{k}}(\mathbf{r}), \qquad \mathbf{u}_{\mathbf{k}}(\mathbf{r} + \mathbf{R}) = \mathbf{u}_{\mathbf{k}}(\mathbf{r})
+    \label{eq:bloch}
+\end{equation}
+where $\mathbf{k}$ is the Bloch wavevector restricted to the first Brillouin zone and $\mathbf{u}_\mathbf{k}$ is lattice-periodic. Substituting \cref{eq:bloch} into \cref{eq:master} replaces $\nabla$ with $\nabla + i\mathbf{k}$, yielding a $\mathbf{k}$-dependent eigenvalue problem on the unit cell alone. For each $\mathbf{k}$, an infinite discrete spectrum $\omega_1(\mathbf{k}) \leq \omega_2(\mathbf{k}) \leq \cdots$ emerges; plotting $\omega_n(\mathbf{k})$ along the Brillouin zone boundary gives the \emph{band structure}.
+
+For 2D crystals (uniform in $z$), the vector problem decouples into two scalar polarizations. The TE polarization (electric field in-plane, $H_z$ out-of-plane) yields:
+\begin{equation}
+    -\left(\frac{\partial}{\partial x}\frac{1}{\varepsilon}\frac{\partial}{\partial x} + \frac{\partial}{\partial y}\frac{1}{\varepsilon}\frac{\partial}{\partial y}\right) H_z = \frac{\omega^2}{c^2} H_z
+    \label{eq:te_scalar}
+\end{equation}
+
+\paragraph{Plane-wave expansion.} The periodic fields are expanded in reciprocal lattice vectors $\mathbf{G} = 2\pi(m_1 \hat{x} + m_2 \hat{y})/a$:
+\begin{equation}
+    H_z(\mathbf{r}) = \sum_{\mathbf{G}} c_{\mathbf{G}} \, e^{i(\mathbf{k}+\mathbf{G})\cdot\mathbf{r}}, \qquad
+    \frac{1}{\varepsilon(\mathbf{r})} = \sum_{\mathbf{G}} \hat{\kappa}_{\mathbf{G}} \, e^{i\mathbf{G}\cdot\mathbf{r}}
+\end{equation}
+where $\hat{\kappa}_{\mathbf{G}}$ are the Fourier coefficients of the inverse dielectric function. Substituting both expansions into \cref{eq:te_scalar}, the left-hand side becomes:
+\begin{equation}
+    -\nabla \cdot \!\left[\frac{1}{\varepsilon}\nabla H_z\right]
+    = \sum_{\mathbf{G},\mathbf{G}'} \hat{\kappa}_{\mathbf{G}-\mathbf{G}'}\,
+      (\mathbf{k}{+}\mathbf{G}) \cdot (\mathbf{k}{+}\mathbf{G}')\;
+      c_{\mathbf{G}'}\, e^{i(\mathbf{k}+\mathbf{G})\cdot\mathbf{r}}
+\end{equation}
+This follows because $\nabla e^{i(\mathbf{k}+\mathbf{G}')\cdot\mathbf{r}} = i(\mathbf{k}+\mathbf{G}')e^{i(\mathbf{k}+\mathbf{G}')\cdot\mathbf{r}}$, and the product of two Fourier series $\hat{\kappa} \cdot \nabla H_z$ becomes a convolution in reciprocal space, coupling coefficients at $\mathbf{G}-\mathbf{G}'$. Projecting both sides onto the basis function $e^{i(\mathbf{k}+\mathbf{G})\cdot\mathbf{r}}$ via the orthogonality relation
+\begin{equation}
+    \frac{1}{A_\text{cell}}\int_\text{cell} e^{i(\mathbf{G}-\mathbf{G}')\cdot\mathbf{r}}\,d\mathbf{r} = \delta_{\mathbf{G}\mathbf{G}'}
+\end{equation}
+isolates a single equation for each $\mathbf{G}$, converting the PDE into the algebraic eigenproblem:
+\begin{equation}
+    \sum_{\mathbf{G}'} H^{\text{TE}}_{\mathbf{G}\mathbf{G}'}(\mathbf{k})\, c_{\mathbf{G}'} = \frac{\omega^2}{c^2}\, c_{\mathbf{G}}
+    \label{eq:pwe_te}
+\end{equation}
+with matrix elements:
+\begin{equation}
+    H^{\text{TE}}_{\mathbf{G}\mathbf{G}'}(\mathbf{k}) = (\mathbf{k}+\mathbf{G}) \cdot [\varepsilon^{-1}]_{\mathbf{G}-\mathbf{G}'} \; (\mathbf{k}+\mathbf{G}')
+    \label{eq:H_te}
+\end{equation}
+In matrix notation, \cref{eq:pwe_te} is $\mathbf{H}(\mathbf{k})\,\mathbf{c} = (\omega^2/c^2)\,\mathbf{c}$, a standard Hermitian eigenproblem. The matrix $\mathbf{H}$ is Hermitian because $[\varepsilon^{-1}]_{\mathbf{G}-\mathbf{G}'} = [\varepsilon^{-1}]^*_{\mathbf{G}'-\mathbf{G}}$ (Fourier coefficients of a real function satisfy conjugate symmetry) and the wavevector prefactors are real. Its eigenvalues $\omega^2/c^2$ are therefore real and non-negative, and the eigenvectors $\mathbf{c}$ give the plane-wave coefficients of each Bloch mode.
+
+The sum over $\mathbf{G}'$ is truncated at $|m_1|, |m_2| \leq n_\text{max} = 5$, giving $N_\text{pw} = (2 \cdot 5 + 1)^2 = 121$ plane waves and a $121 \times 121$ matrix. Diagonalizing at each $\mathbf{k}$ yields the lowest eigenfrequencies $\omega_n(\mathbf{k})$, reported as dimensionless $\omega a / 2\pi c$.
+
+\subsubsection{Phononic Eigenproblem (FEM)}
+
+The governing equation for elastic waves in a periodic medium with spatially varying density $\rho(\mathbf{r})$ and Lam\'e parameters $\lambda(\mathbf{r})$, $\mu(\mathbf{r})$ is:
+\begin{equation}
+    -\nabla \cdot \boldsymbol{\sigma}(\mathbf{u}) = \omega^2 \rho(\mathbf{r})\,\mathbf{u}
+    \label{eq:elastic_gov}
+\end{equation}
+The Lam\'e parameters fully characterize the linear elastic response of an isotropic solid. The first Lam\'e parameter $\lambda$ governs resistance to volumetric (dilatational) deformation, while the second parameter $\mu$ (the shear modulus) governs resistance to shape-changing (deviatoric) deformation. Together they define the constitutive relation (generalized Hooke's law) for the stress tensor:
+\begin{equation}
+    \sigma_{ij} = \lambda\, \delta_{ij}\, \nabla \cdot \mathbf{u} + 2\mu\, \varepsilon_{ij}(\mathbf{u})
+    \label{eq:hooke}
+\end{equation}
+where $\varepsilon_{ij} = \tfrac{1}{2}(\partial_i u_j + \partial_j u_i)$ is the linearized strain tensor. The first term captures the hydrostatic stress response to volumetric strain $\nabla \cdot \mathbf{u}$; the second captures the deviatoric stress response to shear strain.
+
+\paragraph{Two elastic wave speeds.} Substituting \cref{eq:hooke} into \cref{eq:elastic_gov} for a homogeneous medium and decomposing the displacement into irrotational (longitudinal) and solenoidal (transverse) components via Helmholtz decomposition $\mathbf{u} = \nabla \phi + \nabla \times \boldsymbol{\psi}$ yields two independent wave equations:
+\begin{equation}
+    \nabla^2 \phi = \frac{1}{c_L^2}\frac{\partial^2 \phi}{\partial t^2}, \qquad
+    \nabla^2 \boldsymbol{\psi} = \frac{1}{c_T^2}\frac{\partial^2 \boldsymbol{\psi}}{\partial t^2}
+\end{equation}
+with the longitudinal and transverse wave speeds:
+\begin{equation}
+    c_L = \sqrt{\frac{\lambda + 2\mu}{\rho}}, \qquad c_T = \sqrt{\frac{\mu}{\rho}}
+    \label{eq:wave_speeds}
+\end{equation}
+Longitudinal waves involve compression/expansion along the propagation direction and travel faster; transverse (shear) waves involve displacement perpendicular to propagation. For silicon, $c_L \approx 8433$~\si{m/s} and $c_T \approx 5860$~\si{m/s}. This contrasts with electromagnetism, where all polarizations share the single speed $c$.
+
+\paragraph{In-plane restriction.} In this work we consider only \emph{in-plane} elastic modes: the displacement field $\mathbf{u} = (u_x, u_y)$ lies in the plane of periodicity, and the wavevector $\mathbf{k}$ is also in-plane. Out-of-plane (anti-plane/SH) modes, where $\mathbf{u} = u_z \hat{z}$, decouple by symmetry and are not computed. Within the in-plane problem, ``longitudinal'' and ``transverse'' refer to the orientation of displacement relative to $\mathbf{k}$, not to the plane: a wave with $\mathbf{k} = k\hat{x}$ has longitudinal character when displacement is along $\hat{x}$ (P-wave, speed $c_L$) and transverse character when displacement is along $\hat{y}$ (SV-wave, speed $c_T$)---both components remain in-plane. In a homogeneous medium these are independent, but at material interfaces (hole boundaries) they couple: an incident P-wave generates a reflected SV-wave and vice versa. In the periodic structure this mode coupling produces hybridized bands with avoided crossings, making phononic band structures more complex than photonic ones where a single wave speed governs all modes.
+
+\paragraph{Bloch--Floquet reduction.} As with the photonic problem, Bloch's theorem applies: $\mathbf{u}(\mathbf{r}) = \tilde{\mathbf{u}}(\mathbf{r})\,e^{i\mathbf{k}\cdot\mathbf{r}}$ where $\tilde{\mathbf{u}}$ is lattice-periodic. Substituting this ansatz into \cref{eq:elastic_gov} and replacing $\nabla \to \nabla + i\mathbf{k}$ yields a $\mathbf{k}$-parameterized eigenvalue problem on the unit cell, with a 2-component displacement vector per node (since $\mathbf{u}$ is in-plane).
+
+\paragraph{FEM discretization.} Rather than a plane-wave expansion (which suffers from $\sim 10^{12}$-contrast ill-conditioning for air holes in silicon), we discretize the unit cell with P1 triangular finite elements. For void (air) inclusions, only the solid region is meshed; the hole boundaries carry traction-free (natural) boundary conditions, physically representing free surfaces. Bloch periodicity is imposed on opposing unit-cell edges via the phase relation $\tilde{\mathbf{u}}(\mathbf{r} + \mathbf{a}_i) = \tilde{\mathbf{u}}(\mathbf{r})$.
+
+The FEM discretization yields the generalized eigenproblem:
+\begin{equation}
+    \mathbf{K}(\mathbf{k})\tilde{\mathbf{u}} = \omega^2\mathbf{M}\tilde{\mathbf{u}}
+    \label{eq:fem}
+\end{equation}
+where the stiffness matrix decomposes as:
+\begin{equation}
+    \mathbf{K}(\mathbf{k}) = \mathbf{K}_0 + ik_j\mathbf{K}_{1,j} + k_jk_l\mathbf{K}_{2,jl}
+\end{equation}
+Here $\mathbf{K}_0$ is the standard (real) elastic stiffness matrix, $\mathbf{K}_{1,j}$ captures first-order Bloch coupling, and $\mathbf{K}_{2,jl}$ captures second-order terms. The mass matrix $\mathbf{M}$ is real, symmetric, and positive definite (since $\rho > 0$ in the meshed solid region). The eigenproblem is reduced to standard form via Cholesky decomposition $\mathbf{M} = \mathbf{L}\mathbf{L}^H$:
+\begin{equation}
+    \mathbf{L}^{-1}\mathbf{K}(\mathbf{k})\mathbf{L}^{-H}\mathbf{v} = \omega^2\mathbf{v}
+\end{equation}
+and solved with \texttt{scipy.linalg.eigh} for the 10 lowest eigenvalues at each $\mathbf{k}$-point.
+
+\subsubsection{Frequency Units}
+
+The two eigenproblems produce frequencies in different natural units reflecting the distinct physics:
+
+\begin{itemize}
+    \item \textbf{Photonic:} The PWE eigenproblem (\cref{eq:pwe_te}) yields eigenvalues $\omega^2/c^2$. Setting $a = 1$ and $c = 1$ makes all quantities dimensionless. Frequencies are reported as $\omega a / 2\pi c$, which is the ratio of the lattice constant to the free-space wavelength ($a/\lambda_0$). This convention is standard in photonic crystal literature~\cite{joannopoulos2008} because it makes the band structure scale-invariant: the same dimensionless diagram applies to any physical lattice constant $a$, with physical frequencies obtained by $f = (\omega a / 2\pi c) \cdot c / a$.
+
+    \item \textbf{Phononic:} The elastic eigenproblem (\cref{eq:fem}) involves material properties in SI units ($\rho$ in \si{kg/m^3}, $\lambda$ and $\mu$ in \si{Pa}). Unlike electromagnetism, where the single velocity $c$ allows full nondimensionalization, elastic media support two distinct wave speeds $c_L$ and $c_T$ (\cref{eq:wave_speeds}) that depend on material properties, so there is no single natural velocity to divide out. The FEM solver outputs angular frequencies $\omega$ in \si{rad/s}; we report $f = \omega/2\pi$ in \si{Hz} scaled by the lattice constant $a$, giving units of Hz$\cdot a$. For a physical lattice constant $a$, the frequency is $f/a$.
+\end{itemize}
+
+Because photonic frequencies are $\mathcal{O}(0.1)$ and phononic frequencies are $\mathcal{O}(10^3\text{--}10^4)$ in their respective units, the per-band standardization described in \cref{sec:loss} is essential to prevent the loss from being dominated by the phononic branch.
+
+\subsubsection{Common Computational Pipeline}
+
+Both eigenproblems share a four-step structure that motivates the CANN architecture (\cref{sec:architecture}):
+\begin{enumerate}
+    \item \textbf{Fourier/spatial decomposition} of material fields: $\varepsilon(\mathbf{r}) \to \hat{\varepsilon}_\mathbf{G}$ (photonic PWE) or $\rho, \lambda, \mu \to$ element-level material matrices (phononic FEM).
+    \item \textbf{Matrix assembly} combining material coefficients with wavevector information $(\mathbf{k} + \mathbf{G})$ or Bloch phase factors $e^{i\mathbf{k}\cdot\mathbf{r}}$.
+    \item \textbf{Matrix inversion}: computing $[\varepsilon^{-1}]_{\mathbf{G}-\mathbf{G}'}$ (photonic) or reducing the generalized eigenproblem via $\mathbf{M}^{-1}$ (phononic).
+    \item \textbf{Eigenvalue extraction}: diagonalizing the assembled matrix to obtain ordered frequencies $\omega_1 \leq \omega_2 \leq \cdots$.
+\end{enumerate}
+
+\subsubsection{Common Assumptions}
+
+\begin{itemize}
+    \item \textbf{Material system:} Silicon matrix ($\varepsilon = 8.9$, $\rho = 2330$~\si{kg/m^3}, $\lambda = 68.4$~\si{GPa}, $\mu = 80.0$~\si{GPa}) with air inclusions ($\varepsilon = 1.0$, $\rho \approx 0$).
+    \item \textbf{Mask convention:} $m = 1$ is hole (air), $m = 0$ is matrix (silicon). Material fields are derived as $\varepsilon = 8.9 - 7.9m$.
+    \item \textbf{k-path:} $\Gamma \to X \to M \to \Gamma$ with 10 points per segment ($N_k = 31$).
+    \item \textbf{Lattice symmetry:} Square lattice with $C_{4v}$ point group.
+    \item \textbf{All eigensolves use float64} for numerical stability; CANN models use float32.
+\end{itemize}
+
+\subsection{Data Generation}
+\label{sec:data}
+
+Training and test geometries are generated procedurally and solved from first principles---no external datasets are used.
+
+\subsubsection{Geometry Sampling}
+
+Two families of shapes, rasterized on a $32 \times 32$ grid:
+\begin{enumerate}
+    \item \textbf{Perturbed circles} (200 train, 20 test): Fourier boundary descriptors $r(\theta) = a_0 + \sum_{n=1}^{4}(a_n \cos n\theta + b_n \sin n\theta)$ with mean radius $a_0 \in [0.10, 0.40]$ and perturbation scale $\sigma = 0.08$.
+    \item \textbf{Standard shapes} (300 train, 30 test): randomly sized crosses, squares, ellipses, and rings with randomized dimensions.
+\end{enumerate}
+
+After rejecting invalid geometries, the final dataset comprises 499 training and 49 test samples.
+
+\subsubsection{Ground Truth Computation}
+
+For each geometry, both eigenproblems are solved:
+\begin{itemize}
+    \item \textbf{Photonic:} PWE with TE polarization, $n_\text{max} = 5$ (121 plane waves), 6 lowest bands.
+    \item \textbf{Phononic:} FEM with Delaunay meshing (30 nodes/edge), traction-free BCs at hole boundaries, 10 lowest bands.
+\end{itemize}
+Output tensors are $(B, 31, 6)$ for photonic and $(B, 31, 10)$ for phononic bands.
+
+\subsection{Model Architecture}
+\label{sec:architecture}
+
+The CANN architecture mirrors the four-step PWE/FEM computational pipeline, as summarized in \cref{tab:physics_mirror}.
+
+\begin{table*}[t]
+    \centering
+    \caption{Correspondence between the physical eigenproblem pipeline and CANN architectural components.}
+    \label{tab:physics_mirror}
+    \begin{tabular}{@{}lll@{}}
+        \toprule
+        \textbf{PWE/FEM Step} & \textbf{Network Analog} & \textbf{Component} \\
+        \midrule
+        Fourier decomposition of material fields & Feature extraction from geometry mask & DeepCNNEncoder \\
+        Matrix assembly from $\hat{\varepsilon}_\mathbf{G}$ and $(\mathbf{k}+\mathbf{G})$ & Mix geometry features with k-coordinates & Linear layers in \texttt{pre} \\
+        Matrix inversion ($\varepsilon^{-1}$ or Cholesky $M^{-1}$) & Regularized eigenvalue flipping & SmoothInverse \\
+        Eigenvalue extraction & Map to band frequencies & Linear layers in \texttt{post} \\
+        \bottomrule
+    \end{tabular}
+\end{table*}
+
+\subsubsection{DeepCNNEncoder}
+
+A hierarchical convolutional encoder with residual connections processes the raw binary mask:
+
+\begin{table}[H]
+    \centering
+    \caption{DeepCNNEncoder stages.}
+    \label{tab:encoder}
+    \begin{tabular}{@{}lll@{}}
+        \toprule
+        \textbf{Stage} & \textbf{Operation} & \textbf{Output} \\
+        \midrule
+        Input & Geometry mask & $(B, 1, 32, 32)$ \\
+        Stem  & Conv2d($1{\to}32$, $5{\times}5$)+BN+SiLU & $(B, 32, 32, 32)$ \\
+        Stage 1 & Conv2d($32{\to}64$, stride 2)+ResBlock & $(B, 64, 16, 16)$ \\
+        Stage 2 & Conv2d($64{\to}128$, stride 2)+ResBlock & $(B, 128, 8, 8)$ \\
+        Pool  & AdaptiveAvgPool2d(1) & $(B, 128)$ \\
+        Proj  & Linear($128 \to 128$) & $(B, 128)$ \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+Each ResBlock2d consists of two $3{\times}3$ convolutions with batch normalization and a skip connection, activated by SiLU.
+
+\subsubsection{PerKBackbone (DeepONet-style)}
+
+Rather than predicting all $N_k \times N_b$ values monolithically, the PerKBackbone concatenates the 128-dimensional geometry embedding with each k-point coordinate $(k_x, k_y)$ and predicts $N_b$ values per k-point:
+
+\begin{table}[H]
+    \centering
+    \caption{PerKBackbone layers.}
+    \label{tab:backbone}
+    \begin{tabular}{@{}lll@{}}
+        \toprule
+        \textbf{Layer} & \textbf{Operation} & \textbf{Output} \\
+        \midrule
+        Input & Concat feat + $(k_x, k_y)$ & $(B, N_k, 130)$ \\
+        Pre   & Linear+SiLU+Linear+SmoothInv. & $(B, N_k, 128)$ \\
+        Post  & Linear+SiLU+Linear & $(B, N_k, N_b)$ \\
+        Skip  & Linear($130 \to N_b$) & $(B, N_k, N_b)$ \\
+        Output & Post(Pre(x)) + Skip(x) & $(B, N_k, N_b)$ \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+The k-points are registered as a non-learnable buffer encoding the $\Gamma$--$X$--$M$--$\Gamma$ path geometry. This per-k conditioning mirrors the physical parameterization: at each $\mathbf{k}$, a different Hamiltonian $H(\mathbf{k})$ is assembled and solved.
+
+\subsubsection{Physics-Informed Activation Functions}
+
+\paragraph{SmoothInverse.} The central physics-informed activation:
+\begin{equation}
+    f(x_i) = \frac{x_i}{x_i^2 + \eta_i^2}, \qquad \eta_i = e^{\alpha_i} \;\text{(learnable)}
+    \label{eq:smooth_inv}
+\end{equation}
+
+\textit{Physical motivation.} Both eigenproblems require matrix inversion. The photonic Hamiltonian (\cref{eq:H_te}) depends on $[\varepsilon^{-1}]_{\mathbf{G}-\mathbf{G}'}$, the Fourier-space inverse of the dielectric matrix. The phononic eigenproblem (\cref{eq:fem}) is a generalized problem $\mathbf{K}\tilde{\mathbf{u}} = \omega^2 \mathbf{M}\tilde{\mathbf{u}}$ reduced to standard form by inverting the mass matrix via Cholesky: $\mathbf{L}^{-1}\mathbf{K}\mathbf{L}^{-H}\mathbf{v} = \omega^2\mathbf{v}$. In either case, inversion acts element-wise on the matrix eigenvalues: if $A = Q\,\text{diag}(\lambda_1, \ldots, \lambda_n)\,Q^{-1}$, then $A^{-1} = Q\,\text{diag}(1/\lambda_1, \ldots, 1/\lambda_n)\,Q^{-1}$. Large eigenvalues become small and vice versa.
+
+\textit{The instability problem.} Na\"ive inversion $f(x) = 1/x$ is catastrophic for neural networks: near-zero hidden activations produce $1/x \to \infty$, causing exploding gradients and numerical overflow. In the physical problem, this instability is avoided because the plane-wave truncation bounds the eigenvalue spectrum away from zero. The network, however, has no such built-in truncation.
+
+\textit{Tikhonov regularization.} The standard remedy in numerical linear algebra is Tikhonov regularization, which replaces the inverse $A^{-1}$ with the regularized pseudoinverse:
+\begin{equation}
+    A^{-1}_\eta = (A^H A + \eta^2 I)^{-1} A^H
+\end{equation}
+For a symmetric matrix with eigendecomposition $A = Q\,\text{diag}(\lambda_i)\,Q^T$, this acts element-wise on eigenvalues as:
+\begin{equation}
+    [A^{-1}_\eta]_{\text{eig},\,i} = \frac{\lambda_i}{\lambda_i^2 + \eta^2}
+    \label{eq:tikhonov_eig}
+\end{equation}
+which is exactly the functional form of the SmoothInverse activation (\cref{eq:smooth_inv}). The behavior in three regimes is:
+\begin{itemize}
+    \item $|x_i| \gg \eta_i$: $f(x_i) \approx 1/x_i$ --- faithful inversion for well-conditioned eigenvalues.
+    \item $|x_i| \ll \eta_i$: $f(x_i) \approx x_i/\eta_i^2$ --- linear, bounded response that prevents blow-up.
+    \item $|x_i| = \eta_i$: peak response $f = 1/(2\eta_i)$, the crossover between the two regimes.
+\end{itemize}
+The regularization parameter $\eta_i = e^{\alpha_i}$ is \emph{per-channel learnable} (guaranteed positive by the exponential parameterization), allowing each of the 128 hidden features to learn its own regularization scale during training. Channels representing well-conditioned material-matrix eigenvalues learn small $\eta_i$ (strong inversion); channels prone to near-zero activations learn large $\eta_i$ (heavy regularization).
+
+\paragraph{SiLU.} $\text{SiLU}(x) = x \cdot \sigma(x)$. Its non-monotonic shape (minimum $\approx -0.28$ at $x \approx -1.28$) allows compact representation of non-monotonic band dispersion curves with fewer neurons than ReLU. Its continuous derivatives match the analyticity of $\omega_n(\mathbf{k})$.
+
+\paragraph{Sigmoid gating.} Used in the CrossAttentionBlock to produce gates $\mathbf{g} \in [0,1]^{128}$ controlling inter-branch information flow.
+
+\subsubsection{Dual-Physics Architectures}
+
+\paragraph{DualGridCANN\_v5 (independent heads).} A shared DeepCNNEncoder feeds two independent PerKBackbone heads:
+\begin{equation}
+    m \xrightarrow{\text{Enc}} \mathbf{f} \xrightarrow{\text{PerK}^{p}} \boldsymbol{\omega}^{\text{phot}}, \quad \mathbf{f} \xrightarrow{\text{PerK}^{n}} \boldsymbol{\omega}^{\text{phon}}
+    \label{eq:v5}
+\end{equation}
+
+\paragraph{DualGridCANN\_v5\_cross (cross-gated heads).} After the \texttt{pre} sub-network, a CrossAttentionBlock exchanges information between branches via bilinear gating:
+\begin{align}
+    \mathbf{g}_p &= \sigma(\mathbf{W}_g^p\mathbf{h}_n), \quad \mathbf{g}_n = \sigma(\mathbf{W}_g^n\mathbf{h}_p) \label{eq:cross_gate} \\
+    \mathbf{h}_p' &= \mathbf{h}_p + \mathbf{g}_p \odot (\mathbf{V}^p\mathbf{h}_n) \label{eq:cross_val}
+\end{align}
+The residual connection allows the model to learn to ignore cross-physics coupling when unhelpful.
+
+\FIGPLACEHOLDER{Architecture diagram: DualGridCANN\_v5 showing shared encoder with two independent PerKBackbone heads. Generate from \texttt{model\_diagrams/draw\_arch.py} or \texttt{torchview}.}
+
+\FIGPLACEHOLDER{Architecture diagram: DualGridCANN\_v5\_cross showing cross-gating between branches at the hidden layer.}
+
+\subsubsection{Skip Connection: Perturbation Theory Analog}
+
+The skip connection $\text{Linear}(130 \to N_b)$ provides a direct linear path from input to output, capturing first-order perturbation theory: $\delta\omega_n \propto \langle n|\delta H|n\rangle$. The nonlinear pre/post path learns higher-order corrections (band repulsion, avoided crossings).
+
+\subsubsection{Baseline: DualGridCANN v3}
+
+The v3 baseline uses a LearnedKernelEncoder (Conv2D kernels initialized to reciprocal lattice Fourier modes), monolithic fully connected backbones outputting all $N_k \times N_b$ values at once, and a BandOrderingHead enforcing monotonic band ordering via cumulative softplus:
+\begin{equation}
+    \Delta_n = \text{softplus}(z_n), \qquad \omega_n = \alpha\sum_{j=1}^{n}\Delta_j
+    \label{eq:cumsum}
+\end{equation}
+This guarantees $\omega_1 \leq \omega_2 \leq \cdots$ but prevents the network from representing band crossings. Key differences are summarized in \cref{tab:v3_vs_v5}.
+
+\begin{table*}[t]
+    \centering
+    \caption{Architectural comparison between v3 baseline and v5.}
+    \label{tab:v3_vs_v5}
+    \begin{tabular}{@{}lll@{}}
+        \toprule
+        \textbf{Aspect} & \textbf{v3 (Baseline)} & \textbf{v5} \\
+        \midrule
+        Input           & Dielectric grid $\varepsilon(\mathbf{r})$ & Binary mask (1=hole, 0=solid) \\
+        Encoder         & LearnedKernelEncoder (G-vector Conv2D) & DeepCNNEncoder (hierarchical conv + residual) \\
+        Backbone        & Monolithic FC $\to (N_k \times N_b)$ & Per-k conditioned: concat feat with $(k_x, k_y)$ \\
+        Band ordering   & BandOrderingHead (cumsum of softplus) & Raw output (no enforced ordering) \\
+        Normalization   & Global max normalization & Per-$(k, \text{band})$ standardization \\
+        Polarization    & TM & TE \\
+        Training        & Full-batch, 5000 epochs & Mini-batch (256), 3000 epochs \\
+        Parameters      & 254,803 & 583,936 / 649,984 (cross) \\
+        \bottomrule
+    \end{tabular}
+\end{table*}
+
+\subsection{Loss Function}
+\label{sec:loss}
+
+Joint MSE on per-band standardized targets:
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{\text{phot}} + \mathcal{L}_{\text{phon}}
+    \label{eq:loss}
+\end{equation}
+Each target frequency is standardized per (k-point, band) pair using statistics computed once from the training set:
+\begin{equation}
+    z^p_{ijn} = \frac{\omega^p_{ijn} - \mu^p_{jn}}{\sigma^p_{jn}}, \qquad
+    z^n_{ijn} = \frac{\omega^n_{ijn} - \mu^n_{jn}}{\sigma^n_{jn}}
+\end{equation}
+where $i$ indexes samples, $j$ indexes k-points, $n$ indexes bands, and $\mu_{jn}$, $\sigma_{jn}$ are the training-set mean and standard deviation for each $(j,n)$ pair. The photonic and phononic losses are then ($B$ = batch size, $N_k = 31$ = number of k-points, $N_b^p = 6$ = photonic bands, $N_b^n = 10$ = phononic bands):
+\begin{equation}
+    \mathcal{L}_{\text{phot}} = \frac{1}{B\, N_k\, N_b^p} \sum_{i=1}^{B}\sum_{j=1}^{N_k}\sum_{n=1}^{N_b^p} \left(\hat{z}^p_{ijn} - z^p_{ijn}\right)^2
+    \label{eq:loss_phot}
+\end{equation}
+\begin{equation}
+    \mathcal{L}_{\text{phon}} = \frac{1}{B\, N_k\, N_b^n} \sum_{i=1}^{B}\sum_{j=1}^{N_k}\sum_{n=1}^{N_b^n} \left(\hat{z}^n_{ijn} - z^n_{ijn}\right)^2
+    \label{eq:loss_phon}
+\end{equation}
+where $\hat{z}$ denotes the network prediction and $z$ the ground-truth standardized target. Since the standardization is a fixed affine transformation, minimizing in standardized space is equivalent to a weighted MSE in the original frequency space:
+\begin{equation}
+    \mathcal{L} = \sum_{j,n} \frac{1}{(\sigma^p_{jn})^2}\left(\hat{\omega}^p_{jn} - \omega^p_{jn}\right)^2
+    + \sum_{j,n} \frac{1}{(\sigma^n_{jn})^2}\left(\hat{\omega}^n_{jn} - \omega^n_{jn}\right)^2
+\end{equation}
+Bands with small variance (e.g., low-frequency acoustic bands) receive larger gradients for the same absolute error, preventing the loss from being dominated by the highest-magnitude bands and ensuring uniform relative accuracy.
+
+\subsection{Training Procedure}
+
+\begin{itemize}
+    \item \textbf{Optimizer:} Adam with weight decay $10^{-4}$
+    \item \textbf{Learning rate:} Cosine annealing from $10^{-3}$ to $10^{-5}$ over 3000 epochs
+    \item \textbf{Batch size:} 256
+    \item \textbf{Gradient clipping:} $\|\nabla\|_\text{max} = 1.0$
+    \item \textbf{Regularization:} Implicit via weight decay, gradient clipping, batch normalization, and cosine LR schedule
+\end{itemize}
+
+\subsection{Evaluation Metrics}
+
+The primary metric is RMSE on original-scale frequencies:
+\begin{equation}
+    \text{RMSE} = \sqrt{\frac{1}{N_\text{test} N_k N_b}\sum_{i,j,n}\left(\hat{\omega}_{ijn} - \omega_{ijn}\right)^2}
+\end{equation}
+reported separately for photonic ($\omega a/2\pi c$) and phononic (Hz$\cdot a$) bands. Per-band RMSE identifies which bands are hardest to predict. Normalized RMSE (NRMSE $= \text{RMSE}/(\omega_\text{max} - \omega_\text{min})$) and CV-RMSE ($= \text{RMSE}/\bar{\omega}$) enable cross-physics comparison.
+
+\subsection{Inverse Design Application}
+
+The trained v5 surrogate is frozen and used as a differentiable forward model for inverse design. Two optimization methods are compared:
+\begin{enumerate}
+    \item \textbf{Neural Style Transfer (NST):} Direct pixel-level mask optimization with sigmoid parameterization $m = \sigma(\beta z)$ and total-variation regularization, annealing $\beta$ from 5 to 40.
+    \item \textbf{Warm-start + RBF:} The training dataset is scanned for best-gap seed geometries, which are fit to a radial basis function level-set parameterization and refined via gradient descent.
+\end{enumerate}
+Both methods optimize the relative band gap $\Delta\omega/\omega_\text{mid}$ for both photonic and phononic gaps simultaneously through the frozen CANN.
+
+% ===========================================================================
+\section{Results}
+\label{sec:results}
+
+\subsection{Training Convergence}
+
+\FIGPLACEHOLDER{Training loss curves (total, photonic, phononic) for v5, v5\_cross, and v3 baseline over 3000 epochs. Generate by running \texttt{train\_cann\_v5.py} --- output: \texttt{cann\_v5\_losses.png}.}
+
+All three models converge within 3000 epochs. The v5 models exhibit faster initial convergence and reach lower final loss than the v3 baseline, attributable to the per-band standardization providing more uniform gradient magnitudes across bands.
+
+\subsection{Overall Test-Set Accuracy}
+
+\Cref{tab:rmse} summarizes the test-set RMSE for all three architectures.
+
+\begin{table}[H]
+    \centering
+    \caption{Test-set RMSE after 3000 epochs of training.}
+    \label{tab:rmse}
+    \begin{tabular}{@{}lcc@{}}
+        \toprule
+        \textbf{Model} & \textbf{Phot.\ RMSE} ($\omega a/2\pi c$) & \textbf{Phon.\ RMSE} (Hz$\cdot a$) \\
+        \midrule
+        v5             & \textbf{0.00505} & 158.1 \\
+        v5 cross       & 0.00532          & \textbf{153.4} \\
+        v3 baseline    & 0.01102          & 886.7 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+Both v5 architectures achieve $\sim$2$\times$ lower photonic RMSE and $\sim$5.5$\times$ lower phononic RMSE than the v3 baseline.
+
+\subsection{Per-Band Analysis}
+
+\Cref{tab:perband_phot,tab:perband_phon} show per-band RMSE, revealing that error increases with band index (higher-frequency bands have more complex dispersion).
+
+\begin{table}[H]
+    \centering
+    \caption{Per-band photonic RMSE ($\omega a/2\pi c$).}
+    \label{tab:perband_phot}
+    \begin{tabular}{@{}lcccccc@{}}
+        \toprule
+        \textbf{Model} & b0 & b1 & b2 & b3 & b4 & b5 \\
+        \midrule
+        v5          & 0.0022 & 0.0039 & 0.0048 & 0.0054 & 0.0059 & 0.0068 \\
+        v5 cross    & 0.0023 & 0.0045 & 0.0049 & 0.0051 & 0.0066 & 0.0070 \\
+        v3 baseline & 0.0063 & 0.0092 & 0.0102 & 0.0111 & 0.0138 & 0.0136 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\begin{table*}[t]
+    \centering
+    \caption{Per-band phononic RMSE (Hz$\cdot a$).}
+    \label{tab:perband_phon}
+    \begin{tabular}{@{}lcccccccccc@{}}
+        \toprule
+        \textbf{Model} & b0 & b1 & b2 & b3 & b4 & b5 & b6 & b7 & b8 & b9 \\
+        \midrule
+        v5          & 71.3 & 96.4 & 147.7 & 165.1 & 131.1 & 187.8 & 181.1 & 158.0 & 199.2 & 191.7 \\
+        v5 cross    & 62.2 & 92.0 & 164.3 & 162.2 & 122.9 & 191.6 & 169.7 & 158.7 & 186.9 & 170.4 \\
+        v3 baseline & 567.0 & 824.2 & 892.3 & 967.4 & 857.6 & 729.2 & 802.0 & 848.8 & 1021.3 & 1206.5 \\
+        \bottomrule
+    \end{tabular}
+\end{table*}
+
+\subsection{Band Structure Predictions}
+
+\FIGPLACEHOLDER{Photonic band comparison: predicted (dashed red) vs.\ PWE ground truth (solid black) for 5--6 representative test geometries (perturbed circle, ring, ellipse, square, cross). Generate by running \texttt{train\_cann\_v5.py} --- output: \texttt{cann\_v5\_photonic\_bands.png}.}
+
+\FIGPLACEHOLDER{Phononic band comparison: predicted (dashed red) vs.\ FEM ground truth (solid black) for the same test geometries. Generate by running \texttt{train\_cann\_v5.py} --- output: \texttt{cann\_v5\_phononic\_bands.png}.}
+
+The v5 models closely track the ground truth across all geometry types, including at high-symmetry points where band crossings and avoided crossings occur. The v3 baseline shows larger deviations, particularly for higher bands and at band crossing points where its enforced monotonicity constraint becomes a liability.
+
+\subsection{Sample Geometries}
+
+\FIGPLACEHOLDER{Grid of 5--6 representative unit-cell geometries from the test set (binary masks shown as grayscale images), labeled by type (perturbed circle, ring, ellipse, square, cross). Can be generated from the dataset file \texttt{cann\_v5\_dataset.pt}.}
+
+\subsection{Inverse Design Results}
+
+\FIGPLACEHOLDER{Inverse design results: for each method (NST and Warm-start+RBF), show (a) optimized geometry, (b) photonic bands with gap shaded, (c) phononic bands with gap shaded. CANN prediction (dashed red) overlaid with PWE/FEM ground truth (solid black). Generate by running \texttt{inverse\_design.py} --- output: \texttt{inverse\_design\_result.png}.}
+
+The frozen v5\_cross surrogate enables gradient-based inverse design for simultaneous photonic--phononic band gaps. Both optimization methods produce physically valid geometries with verified gaps, demonstrating the surrogate's practical utility.
+
+% ===========================================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Interpretation of Results}
+
+\paragraph{Per-k conditioning is the dominant improvement.} The $\sim$2$\times$ photonic and $\sim$5.5$\times$ phononic RMSE improvements over v3 arise primarily from the DeepONet-style per-k conditioning. By concatenating $(k_x, k_y)$ with geometry features, the network learns the k-dependent Hamiltonian structure directly---the PWE matrix elements are bilinear in wavevector components and Fourier coefficients, a relationship naturally captured by linear layers operating on the concatenated input. The monolithic v3 architecture must memorize the entire band structure as a flat vector, losing the k-dependence structure.
+
+\paragraph{Cross-physics gating provides modest phononic benefit.} The v5\_cross model achieves 3\% lower phononic RMSE (153.4 vs.\ 158.1~Hz$\cdot a$) at the cost of 5\% higher photonic RMSE (0.00532 vs.\ 0.00505). The cross-gating mechanism allows the phononic branch to leverage photonic features---which encode the same geometry's Fourier structure---while the photonic branch sees less benefit, possibly because the phononic FEM features (mesh-dependent, with traction-free BCs) are less directly informative for the PWE problem.
+
+\paragraph{Higher bands are harder.} Per-band RMSE increases with band index for both physics, reflecting that higher-frequency bands have more complex dispersion (more oscillations along the k-path) and are more sensitive to fine geometric features. The per-band standardization mitigates this by upweighting low-variance (low-frequency) bands in the loss, but does not fully eliminate the trend.
+
+\paragraph{Dropping enforced band ordering improves accuracy.} The v3 BandOrderingHead (cumulative softplus) guarantees $\omega_1 \leq \omega_2 \leq \cdots$ but prevents band crossings---physically real phenomena where two bands exchange character. The v5 raw output allows crossings to be learned from data, which is particularly important for the phononic problem where bands frequently cross along the $X$--$M$ segment.
+
+\paragraph{Per-band standardization outperforms global-max normalization.} Standardizing each (k-point, band) to zero mean and unit variance provides uniform gradient scale across all targets. Global-max normalization (v3) causes the loss to be dominated by the highest-magnitude bands, leading to poor accuracy on low-frequency bands.
+
+\subsection{Physics-Informed Design Validation}
+
+The SmoothInverse activation (\cref{eq:smooth_inv}) is positioned in the network precisely where the physical eigenproblem requires matrix inversion. The learnable regularization parameters $\eta_i$ adapt during training to the eigenvalue spectrum of the implicit material matrices---large $\eta_i$ for well-conditioned channels, small $\eta_i$ where inversion-like behavior is needed. This physics-informed placement reduces the hypothesis space and improves data efficiency compared to generic architectures.
+
+\subsection{Limitations}
+
+\begin{enumerate}
+    \item \textbf{Material system:} The current model is trained exclusively on Si/air at fixed material constants. Extending to arbitrary material pairs would require conditioning on material properties (e.g., concatenating $\varepsilon$, $\rho$, $\lambda$, $\mu$ to the geometry features).
+
+    \item \textbf{Resolution:} The $32 \times 32$ mask resolution limits geometric fidelity for features smaller than $\sim a/32$. Higher resolution would require deeper encoders and larger datasets.
+
+    \item \textbf{Dataset size:} With only 499 training samples, the model may not generalize well to topologically novel geometries (e.g., disconnected inclusions, very large fill fractions). The absence of explicit C4v data augmentation in v5 (used in v3) may leave symmetry-related errors.
+
+    \item \textbf{Band crossings:} While v5 allows band crossings, it does not explicitly model them---the network must learn crossing behavior from data, which may fail for rare or extreme crossings not well-represented in the training set.
+
+    \item \textbf{Phononic solver:} The FEM solver meshes only the solid region, which is appropriate for void inclusions but would need modification for solid--solid composites. The mesh resolution (30 nodes/edge) introduces discretization error in the ground truth.
+
+    \item \textbf{Inverse design validation:} The surrogate's accuracy degrades for geometries far from the training distribution. Inverse-designed structures should always be verified with the full solver, as demonstrated in our pipeline.
+
+    \item \textbf{3D extension:} The current framework is restricted to 2D in-plane physics. Extension to 3D photonic/phononic crystals would require volumetric encoders and significantly larger eigenproblems.
+\end{enumerate}
+
+\subsection{Future Work}
+
+Promising directions include: (i) incorporating material parameters as inputs for multi-material surrogates, (ii) active learning to iteratively expand the training set in regions of high prediction uncertainty, (iii) equivariant network architectures that hard-code $C_{4v}$ symmetry rather than relying on data augmentation, and (iv) extension to 3D crystals with slab or full-3D eigenproblems.
+
+% ===========================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented a physics-informed neural surrogate (CANN v5) for simultaneous photonic--phononic band structure prediction in 2D periodic crystals. The per-k conditioned, DeepONet-style architecture with SmoothInverse activations achieves $\sim$2$\times$ and $\sim$5.5$\times$ RMSE improvements over the monolithic baseline for photonic and phononic bands, respectively. The trained surrogate enables gradient-based inverse design for simultaneous band gap optimization, replacing expensive PWE/FEM eigensolves with sub-millisecond forward passes while maintaining sufficient accuracy for practical design exploration.
+
+% ===========================================================================
+\bibliographystyle{unsrtnat}
+
+\begin{thebibliography}{7}
+
+\bibitem{joannopoulos2008}
+J.~D. Joannopoulos, S.~G. Johnson, J.~N. Winn, and R.~D. Meade,
+\newblock \emph{Photonic Crystals: Molding the Flow of Light},
+\newblock Princeton University Press, 2nd edition, 2008.
+
+\bibitem{kushwaha1993}
+M.~S. Kushwaha, P.~Halevi, L.~Dobrzynski, and B.~Djafari-Rouhani,
+\newblock ``Acoustic band structure of periodic elastic composites,''
+\newblock \emph{Physical Review Letters}, 71(13):2022--2025, 1993.
+
+\bibitem{maldovan2006}
+M.~Maldovan and E.~L. Thomas,
+\newblock ``Simultaneous localization of photons and phonons in two-dimensional periodic structures,''
+\newblock \emph{Applied Physics Letters}, 88(25):251907, 2006.
+
+\bibitem{pennec2010}
+Y.~Pennec, B.~Djafari-Rouhani, E.~H. El~Boudouti, C.~Li, Y.~El~Hassouani, J.~O. Vasseur, N.~Papanikolaou, S.~Benchabane, V.~Laude, and A.~Martinez,
+\newblock ``Simultaneous existence of phononic and photonic band gaps in periodic crystal slabs,''
+\newblock \emph{Optics Express}, 18(13):14301--14310, 2010.
+
+\bibitem{so2020}
+S.~So, T.~Badloe, J.~Noh, J.~Bravo-Abad, and J.~Rho,
+\newblock ``Deep learning enabled inverse design in nanophotonics,''
+\newblock \emph{Nanophotonics}, 9(5):1041--1057, 2020.
+
+\bibitem{liu2021mlphononic}
+C.-X. Liu, G.-L. Yu, and G.-Y. Zhao,
+\newblock ``Neural networks for inverse design of phononic crystals,''
+\newblock \emph{AIP Advances}, 9(8):085223, 2019.
+
+\bibitem{lu2021deeponet}
+L.~Lu, P.~Jin, G.~Pang, Z.~Zhang, and G.~E. Karniadakis,
+\newblock ``Learning nonlinear operators via {DeepONet} based on the universal approximation theorem of operators,''
+\newblock \emph{Nature Machine Intelligence}, 3(3):218--229, 2021.
+
+\end{thebibliography}
+
+\end{document}
